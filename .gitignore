@@ -1,0 +1,15 @@
+# Java / Maven
+server/target/
+*.class
+
+# Node / Angular
+client/node_modules/
+client/dist/
+client/.angular/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+Thumbs.db
+.DS_Store
