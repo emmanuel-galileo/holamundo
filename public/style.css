@@ -1,0 +1,524 @@
+/* ==========================================================================
+   UHIP Ultra-Resolution Image Viewer - EarthCam Cinematic Design System
+   Pure Vanilla CSS3 - High Performance Dark Theme & Glassmorphism
+   Zero External Dependencies - 100% Offline Compatible
+   ========================================================================== */
+
+:root {
+    --bg-base: #06080d;
+    --bg-surface: rgba(13, 17, 26, 0.82);
+    --bg-surface-border: rgba(255, 255, 255, 0.1);
+    --bg-surface-hover: rgba(26, 34, 50, 0.9);
+
+    --accent-cyan: #00e5ff;
+    --accent-emerald: #00e676;
+    --accent-amber: #ffd600;
+    --accent-coral: #ff5252;
+    --accent-purple: #b388ff;
+
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+
+    --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --radius-pill: 24px;
+
+    --shadow-glass: 0 16px 40px rgba(0, 0, 0, 0.6);
+    --shadow-dock: 0 8px 32px rgba(0, 0, 0, 0.55), 0 0 1px rgba(255, 255, 255, 0.15);
+    --blur-glass: blur(20px);
+    --transition-smooth: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    font-family: var(--font-family);
+    font-size: 14px;
+}
+
+#app-container {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+}
+
+#viewport-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+    background-color: var(--bg-base);
+}
+
+#viewport-canvas:active {
+    cursor: grabbing;
+}
+
+/* ==========================================================================
+   1. EarthCam Thin Fixed Top Bar
+   ========================================================================== */
+
+#top-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 42px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(8, 11, 16, 0.65);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    z-index: 100;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.brand-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--accent-cyan);
+    box-shadow: 0 0 10px var(--accent-cyan);
+}
+
+.brand-dot.pulse {
+    animation: pulseGlow 2.5s infinite ease-in-out;
+}
+
+@keyframes pulseGlow {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+.brand-title {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.badge {
+    font-size: 9px;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent-cyan), #0070f3);
+    color: #000;
+    padding: 2px 5px;
+    border-radius: 4px;
+    letter-spacing: 0.8px;
+}
+
+.image-title {
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 45vw;
+}
+
+.connection-status {
+    display: flex;
+    gap: 6px;
+}
+
+.status-pill {
+    font-size: 9px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    transition: var(--transition-smooth);
+}
+
+.status-pill.online {
+    background: rgba(0, 230, 118, 0.16);
+    color: var(--accent-emerald);
+    border: 1px solid rgba(0, 230, 118, 0.4);
+}
+
+.status-pill.offline {
+    background: rgba(255, 82, 82, 0.16);
+    color: var(--accent-coral);
+    border: 1px solid rgba(255, 82, 82, 0.4);
+}
+
+/* ==========================================================================
+   2. FPS Corner Pill
+   ========================================================================== */
+
+#fps-pill {
+    position: fixed;
+    top: 54px;
+    right: 16px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    background: rgba(13, 17, 26, 0.7);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: #ffffff;
+    z-index: 95;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+#fps-pill.hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-8px);
+}
+
+.fps-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: var(--accent-emerald);
+    box-shadow: 0 0 8px var(--accent-emerald);
+}
+
+.fps-val {
+    font-weight: 700;
+    color: var(--accent-cyan);
+}
+
+.fps-unit {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+/* ==========================================================================
+   3. Collapsible Telemetry Panel
+   ========================================================================== */
+
+.glass-panel {
+    position: fixed;
+    top: 54px;
+    right: 16px;
+    width: 340px;
+    max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
+    background: var(--bg-surface);
+    backdrop-filter: var(--blur-glass);
+    -webkit-backdrop-filter: var(--blur-glass);
+    border: 1px solid var(--bg-surface-border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-glass);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    z-index: 100;
+    pointer-events: auto;
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease;
+}
+
+.glass-panel.hidden {
+    opacity: 0;
+    transform: translateX(24px) scale(0.98);
+    pointer-events: none;
+}
+
+/* Custom Scrollbar for Panel */
+.glass-panel::-webkit-scrollbar {
+    width: 5px;
+}
+.glass-panel::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+}
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-bottom: 8px;
+}
+
+.panel-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.panel-title-group h2 {
+    font-size: 13px;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: 0.4px;
+}
+
+.panel-close-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: var(--transition-smooth);
+}
+
+.panel-close-btn:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Metrics Grid */
+.metrics-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.metric-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--radius-md);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: var(--transition-smooth);
+}
+
+.metric-card:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.metric-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.metric-value-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.metric-value {
+    font-family: var(--font-mono);
+    font-size: 20px;
+    font-weight: 700;
+    color: #ffffff;
+    line-height: 1;
+}
+
+.metric-value.small {
+    font-size: 14px;
+    color: var(--accent-cyan);
+}
+
+.metric-value.small-right {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-left: auto;
+}
+
+.metric-sub-label {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.metric-unit {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.metric-tag {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 2px 5px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+}
+
+.metric-tag.slow-start {
+    background: rgba(255, 214, 0, 0.15);
+    color: var(--accent-amber);
+    border: 1px solid rgba(255, 214, 0, 0.3);
+}
+
+.metric-tag.congestion-avoidance {
+    background: rgba(0, 230, 118, 0.15);
+    color: var(--accent-emerald);
+    border: 1px solid rgba(0, 230, 118, 0.3);
+}
+
+.bar-track {
+    width: 100%;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-amber), var(--accent-emerald));
+    border-radius: 2px;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.bar-fill.cyan {
+    background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
+}
+
+.metric-sub {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+/* ==========================================================================
+   4. Centered Floating Bottom Dock (EarthCam Style)
+   ========================================================================== */
+
+#bottom-dock {
+    position: fixed;
+    bottom: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    background: rgba(13, 17, 26, 0.78);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 28px;
+    box-shadow: var(--shadow-dock);
+    z-index: 100;
+}
+
+.dock-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: var(--transition-smooth);
+}
+
+.dock-btn:hover {
+    background: rgba(0, 229, 255, 0.14);
+    border-color: rgba(0, 229, 255, 0.45);
+    color: var(--accent-cyan);
+    transform: translateY(-2px);
+    box-shadow: 0 0 14px rgba(0, 229, 255, 0.3);
+}
+
+.dock-btn:active {
+    transform: translateY(0) scale(0.95);
+}
+
+.dock-btn.active {
+    background: rgba(0, 229, 255, 0.2);
+    border-color: rgba(0, 229, 255, 0.5);
+    color: var(--accent-cyan);
+    box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+}
+
+.dock-btn.warning {
+    color: #ff8a80;
+}
+
+.dock-btn.warning:hover {
+    background: rgba(255, 82, 82, 0.2);
+    border-color: rgba(255, 82, 82, 0.5);
+    color: #ff5252;
+    box-shadow: 0 0 14px rgba(255, 82, 82, 0.3);
+}
+
+.dock-divider {
+    width: 1px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.12);
+    margin: 0 2px;
+}
+
+/* ==========================================================================
+   5. Notification Toast
+   ========================================================================== */
+
+.toast {
+    position: fixed;
+    bottom: 74px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(18, 23, 34, 0.92);
+    backdrop-filter: var(--blur-glass);
+    -webkit-backdrop-filter: var(--blur-glass);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: var(--radius-md);
+    padding: 8px 18px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 500;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    z-index: 1000;
+    pointer-events: none;
+    letter-spacing: 0.3px;
+}
+
+.toast.hidden {
+    opacity: 0;
+    transform: translateX(-50%) translateY(12px);
+}
