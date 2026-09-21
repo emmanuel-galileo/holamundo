@@ -5,9 +5,9 @@
  */
 export class TileCache {
     /**
-     * @param {number} baseCapacity Base capacity for tiles in memory (default 120).
+     * @param {number} baseCapacity Base capacity for tiles in memory (default 1000).
      */
-    constructor(baseCapacity = 120) {
+    constructor(baseCapacity = 1000) {
         this.baseCapacity = baseCapacity;
         this.maxTiles = baseCapacity;
         /** @type {Map<string, ImageBitmap>} */
@@ -58,7 +58,7 @@ export class TileCache {
      */
     adjustCapacity(visibleCount) {
         const count = visibleCount || 0;
-        this.maxTiles = Math.max(this.baseCapacity, Math.ceil(count * 2.5));
+        this.maxTiles = Math.max(this.baseCapacity, Math.ceil(count * 6));
     }
 
     /**
@@ -141,6 +141,13 @@ export class TileCache {
     isKeyProtected(key) {
         if (this.immortalKeys.has(key) || this.visibleKeys.has(key)) {
             return true;
+        }
+        const colonIndex = key.indexOf(':');
+        if (colonIndex > 0) {
+            const z = parseInt(key.substring(0, colonIndex), 10);
+            if (!isNaN(z) && z <= 3) {
+                return true;
+            }
         }
         return this.isLevelLocked(key);
     }

@@ -104,12 +104,29 @@ export class Viewport {
 
     /**
      * Derives discrete pyramidal tile level z (0 to maxZoom) from continuous scale.
-     * Uses Math.floor to avoid premature requests for dense high-resolution levels.
+     * Applies pixel density calibration: promotes to z+1 if tile stretch exceeds 1.25x,
+     * and guarantees minimum cover level matches or exceeds screen resolution to eliminate blur.
      * @returns {number}
      */
     getTileLevel() {
         const rawLevel = this.maxZoom + Math.log2(this.currentScale);
-        return Math.max(0, Math.min(this.maxZoom, Math.floor(rawLevel)));
+        const candidateLevel = this.calculateSharpenedLevel(rawLevel);
+        const minCoverLevel = this.computeMinMonitorCoverLevel();
+        const finalLevel = Math.max(candidateLevel, minCoverLevel);
+        return Math.max(0, Math.min(this.maxZoom, finalLevel));
+    }
+
+    calculateSharpenedLevel(rawLevel) {
+        const baseLevel = Math.floor(rawLevel);
+        const stretch = Math.pow(2, rawLevel - baseLevel);
+        return (stretch > 1.25) ? baseLevel + 1 : baseLevel;
+    }
+
+    computeMinMonitorCoverLevel() {
+        if (!this.canvas || !this.canvas.width) return 0;
+        const maxScreenDim = Math.max(this.canvas.width, this.canvas.height);
+        const neededTiles = maxScreenDim / this.tileSize;
+        return Math.max(0, Math.ceil(Math.log2(neededTiles)));
     }
 
     /**
@@ -140,7 +157,7 @@ export class Viewport {
 
         this.clampPosition();
 
-        if (viewChanged && !this.isWheelZooming) {
+        if (viewChanged) {
             this.notifyViewChanged();
         }
     }
@@ -159,7 +176,6 @@ export class Viewport {
 
     handleMouseDown(e) {
         this.isDragging = true;
-        this.cancelWheelTimer();
         this.dragStartX = e.clientX;
         this.dragStartY = e.clientY;
         this.vx = 0;
@@ -202,10 +218,9 @@ export class Viewport {
         this.zoomAnchorScreenX = e.clientX - rect.left;
         this.zoomAnchorScreenY = e.clientY - rect.top;
 
-        const factor = e.deltaY < 0 ? 1.15 : (1 / 1.15);
+        const factor = e.deltaY < 0 ? 1.18 : (1 / 1.18);
         this.targetScale = Math.max(this.minScale, Math.min(this.maxScale, this.targetScale * factor));
-
-        this.scheduleWheelNetworkTimer();
+        this.notifyViewChanged();
     }
 
     applyZoomStep(delta, cursorX = this.canvas.width / 2, cursorY = this.canvas.height / 2) {
@@ -213,35 +228,7 @@ export class Viewport {
         this.zoomAnchorScreenX = cursorX;
         this.zoomAnchorScreenY = cursorY;
         this.targetScale = Math.max(this.minScale, Math.min(this.maxScale, this.targetScale * factor));
-
-        this.scheduleWheelNetworkTimer();
-    }
-
-    scheduleWheelNetworkTimer() {
-        this.isWheelZooming = true;
-        this.cancelWheelTimer();
-        this.wheelNetworkTimer = setTimeout(() => this.handleWheelSettle(), 120);
-    }
-
-    cancelWheelTimer() {
-        if (this.wheelNetworkTimer) {
-            clearTimeout(this.wheelNetworkTimer);
-            this.wheelNetworkTimer = null;
-        }
-    }
-
-    handleWheelSettle() {
-        this.wheelNetworkTimer = null;
-        this.isWheelZooming = false;
-        this.notifyWheelSettled();
-    }
-
-    notifyWheelSettled() {
-        if (this.onWheelNetworkSettle) {
-            this.onWheelNetworkSettle();
-        } else {
-            this.notifyViewChanged();
-        }
+        this.notifyViewChanged();
     }
 
     centerView() {
@@ -261,7 +248,7 @@ export class Viewport {
         const diff = this.targetScale - this.currentScale;
         if (Math.abs(diff) > 0.00005) {
             const prevScale = this.currentScale;
-            this.currentScale += diff * 0.15;
+            this.currentScale += diff * 0.22;
             this.adjustCameraForScaleChange(prevScale, this.currentScale);
             return true;
         }

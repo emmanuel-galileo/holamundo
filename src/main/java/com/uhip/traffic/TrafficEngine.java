@@ -6,8 +6,10 @@ package com.uhip.traffic;
  */
 public final class TrafficEngine {
 
-    public static final int MAX_CWND = 64;
-    public static final int MIN_SSTHRESH = 2;
+    public static final int MIN_CWND = 32;
+    public static final int MAX_CWND = 256;
+    public static final int INITIAL_SSTHRESH = 128;
+    public static final int INITIAL_CWND = 64;
 
     private int cwnd;
     private int ssthresh;
@@ -16,13 +18,13 @@ public final class TrafficEngine {
     public record Snapshot(int cwnd, int ssthresh, boolean inSlowStart) {}
 
     public TrafficEngine(int initialCwnd, int initialSsthresh) {
-        this.cwnd = initialCwnd;
-        this.ssthresh = initialSsthresh;
+        this.cwnd = Math.max(MIN_CWND, initialCwnd);
+        this.ssthresh = Math.max(MIN_CWND, initialSsthresh);
         this.inSlowStart = true;
     }
 
     public static TrafficEngine createDefault() {
-        return new TrafficEngine(1, 16);
+        return new TrafficEngine(INITIAL_CWND, INITIAL_SSTHRESH);
     }
 
     /**
@@ -38,7 +40,7 @@ public final class TrafficEngine {
     }
 
     /**
-     * Orchestrator: Invoked when congestion, latency timeout or backpressure occurs.
+     * Orchestrator: Invoked when actual network congestion or buffer backpressure occurs.
      */
     public synchronized void onCongestion() {
         multiplicativeDecrease();
@@ -47,10 +49,12 @@ public final class TrafficEngine {
     }
 
     /**
-     * Orchestrator: Invoked on abrupt camera movement or viewport cancellation.
+     * Orchestrator: Invoked on camera movement or viewport cancellation.
+     * Preserves a high-bandwidth window for newly visible tiles without penalizing throughput.
      */
     public synchronized void onAbort() {
-        onCongestion();
+        cwnd = Math.max(MIN_CWND, Math.min(cwnd, INITIAL_SSTHRESH));
+        inSlowStart = false;
     }
 
     /**
@@ -96,11 +100,11 @@ public final class TrafficEngine {
     }
 
     private void multiplicativeDecrease() {
-        ssthresh = Math.max(MIN_SSTHRESH, cwnd / 2);
+        ssthresh = Math.max(MIN_CWND, cwnd / 2);
     }
 
     private void resetToInitialWindow() {
-        cwnd = 1;
+        cwnd = MIN_CWND;
     }
 
     private void capWindow() {

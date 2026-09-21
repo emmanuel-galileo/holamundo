@@ -4,8 +4,11 @@
 [![Virtual Threads](https://img.shields.io/badge/Concurrency-Virtual%20Threads-blue.svg)]()
 [![Protocol](https://img.shields.io/badge/Protocol-UHIP%20v1.0-brightgreen.svg)]()
 [![No CDN](https://img.shields.io/badge/Dependencies-Zero%20CDN%20%28Offline%29-success.svg)]()
+[![Documentation](https://img.shields.io/badge/Documento-Protocolo%20UHIP%20(35%25)-blue.svg)](DOCUMENTO_PROTOCOLO_UHIP.md)
 
 Sistema distribuido de alto rendimiento para navegación e inspección de imágenes masivas de gigapíxeles (simulación de más de 100 GB) sobre redes de ancho de banda variable, sin saturar la memoria RAM/GPU del navegador ni la capacidad de procesamiento del servidor.
+
+> 📖 **Documento Formal de Entrega (35% de la Nota):** Consulte la especificación completa, fundamentos matemáticos y referencias RFC en [DOCUMENTO_PROTOCOLO_UHIP.md](DOCUMENTO_PROTOCOLO_UHIP.md).
 
 ---
 
@@ -188,10 +191,10 @@ Cada tesela en el canal de datos se transmite en un frame binario con el siguien
 
 | Algoritmo | Componente | Descripción |
 |---|---|---|
-| **Slow Start + AIMD** | `TrafficEngine.java` | Inicia en `cwnd=1`. En Slow Start se duplica por cada ACK (`cwnd *= 2`) hasta `ssthresh=16`. Luego pasa a Congestion Avoidance (`cwnd += 1`). Ante congestión o `ABORT`, aplica disminución multiplicativa: `ssthresh = max(2, cwnd/2)`, `cwnd = 1`. |
-| **Cola Manhattan** | `TileDispatcher.java` | Prioridad $= \|tileX - centerX\| + \|tileY - centerY\|$. Las teselas centrales se transmiten primero. |
-| **Zoom Continuo e Inercial** | `viewport.js` | Sistema dual `currentScale` y `targetScale` con amortiguación `lerp(0.15)` manteniendo invariante el píxel bajo el cursor del ratón. |
-| **Fallback Piramidal Recursivo** | `renderer.js` | Elimina huecos negros dibujando de forma recursiva subcuadrantes de teselas ancestro ($z-1$ a $z=0$) escalados con suavizado bilineal mientras llegan las teselas nativas. |
+| **Slow Start + AIMD (Piso Operativo Localhost)** | `TrafficEngine.java` | Inicia con piso operativo `minCwnd=16` para despacho inmediato de viewport completo sub-20ms. En Slow Start se duplica por cada ACK (`cwnd *= 2`) hasta `ssthresh=32`. Luego pasa a Congestion Avoidance (`cwnd += 1`). Ante congestión o `ABORT`, aplica disminución multiplicativa respetando el piso: `ssthresh = max(minCwnd, cwnd/2)`, `cwnd = minCwnd`. |
+| **Cola Manhattan** | `TileDispatcher.java` | Prioridad $= \|tileX - centerX\| + \|tileY - centerY\|$. Las teselas centrales se transmiten primero. Purga instantánea de cola en `clearStaleQueueIfEpochAdvanced` antes de sincronizar época. |
+| **Calibración de Nitidez & Zoom Inercial** | `viewport.js` | Densidad de píxeles calibrada: promueve a $z+1$ si el estiramiento supera $1.25\times$ y asegura nivel Cover que iguala o supera la resolución del monitor (ej. Nivel 3 de 2048 px para 1080p). Amortiguación `lerp(0.15)` e inercia cinemática amortiguada. |
+| **Relevo Visual Continuo (Sin caída a L0)** | `renderer.js` | Durante transiciones de zoom, retiene dibujadas las teselas del último nivel estable escaladas en Canvas y prohíbe sustituir el lienzo por L0 si existe cualquier nivel intermedio en memoria. |
 | **Caché Dinámico Protegido** | `cache.js` | Capacidad dinámica proporcional a las teselas visibles ($\ge \text{visible} \times 2.5$, base 120). Evicción LRU que nunca expulsa teselas visibles ni ancestros en uso. |
 | **Prefetch Direccional** | `viewport.js` | Evalúa el vector de velocidad $(dx, dy)$ al arrastrar con el mouse; expande el bounding box en la dirección del movimiento para solicitar teselas antes de que sean visibles. |
 | **Cancelación de Época** | `TileDispatcher` y `ClientSession` | Al mover bruscamente la cámara o cambiar de zoom, se incrementa la época (`epoch`). El servidor y cliente purgan automáticamente cualquier tesela con época obsoleta. |

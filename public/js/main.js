@@ -107,6 +107,10 @@ class Application {
     handleTileArrived(key) {
         if (key === '0:0:0') {
             this.cache.markImmortal('0:0:0');
+            const baseBitmap = this.cache.get('0:0:0');
+            if (baseBitmap) {
+                this.renderer.setBaseThumbnail(baseBitmap);
+            }
         }
     }
 
@@ -128,24 +132,37 @@ class Application {
     }
 
     scheduleSyncView() {
-        if (this.syncDebounceTimer) {
-            clearTimeout(this.syncDebounceTimer);
-        }
-        this.syncDebounceTimer = setTimeout(() => {
+        const now = performance.now();
+        if (!this.lastSyncTime) this.lastSyncTime = 0;
+        const elapsed = now - this.lastSyncTime;
+
+        if (elapsed >= 30) {
+            if (this.syncDebounceTimer) {
+                clearTimeout(this.syncDebounceTimer);
+                this.syncDebounceTimer = null;
+            }
+            this.lastSyncTime = now;
             this.dispatchSyncViewOrchestrator();
-        }, 50);
+        } else if (!this.syncDebounceTimer) {
+            this.syncDebounceTimer = setTimeout(() => {
+                this.syncDebounceTimer = null;
+                this.lastSyncTime = performance.now();
+                this.dispatchSyncViewOrchestrator();
+            }, Math.max(5, 30 - elapsed));
+        }
     }
 
     dispatchSyncViewOrchestrator() {
         const bounds = this.viewport.computeVisibleBounds();
         const currentZoom = bounds.zoom;
 
-        if (this.lastZoom !== undefined && this.lastZoom !== currentZoom) {
+        const zoomChanged = (this.lastZoom !== undefined && this.lastZoom !== currentZoom);
+        if (zoomChanged) {
             this.cache.lockLevel(this.lastZoom);
-            this.protocol.sendAbort(this.lastEpoch);
+            this.lastZoom = currentZoom;
+            this.lastEpoch++;
         }
-        this.lastZoom = currentZoom;
-        this.lastEpoch++;
+
         this.protocol.sendSyncView(bounds, this.lastEpoch);
     }
 

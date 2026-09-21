@@ -67,10 +67,41 @@ public final class ClientSession {
 
     public void setDataConnection(WebSocket conn) {
         this.dataConnection = conn;
+        if (conn != null && conn.isOpen()) {
+            streamOverviewPyramid();
+        }
     }
 
     public WebSocket getDataConnection() {
         return dataConnection;
+    }
+
+    /**
+     * Streams the immortal overview pyramid (zoom levels 0 to 3, 85 tiles total)
+     * with epoch 0 so the client has 100% of the panoramic image in RAM permanently.
+     */
+    public void streamOverviewPyramid() {
+        virtualThreadExecutor.submit(() -> {
+            try {
+                for (int z = 0; z <= 3; z++) {
+                    int maxTile = (1 << z) - 1;
+                    for (int y = 0; y <= maxTile; y++) {
+                        for (int x = 0; x <= maxTile; x++) {
+                            if (dataConnection == null || !dataConnection.isOpen()) {
+                                return;
+                            }
+                            byte[] jpeg = tileManager.getTile(z, x, y);
+                            if (jpeg != null) {
+                                byte[] frame = UhipCodec.encodeTileData(0, z, x, y, jpeg);
+                                dataConnection.send(ByteBuffer.wrap(frame));
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // Client may disconnect during overview transfer
+            }
+        });
     }
 
     /**
@@ -79,6 +110,8 @@ public final class ClientSession {
     public void triggerDispatch() {
         virtualThreadExecutor.submit(this::pumpBatchOrchestration);
     }
+
+    private record PreparedTile(TileDispatcher.TileTask task, byte[] jpeg) {}
 
     /**
      * Orchestrator: Dispatches tiles according to current congestion window (cwnd).
@@ -96,8 +129,15 @@ public final class ClientSession {
             if (batch.isEmpty()) {
                 return;
             }
-            notifyBatchStart(batch.size(), cwnd);
-            transmitBatch(batch);
+            List<PreparedTile> preparedTiles = prepareValidTiles(batch);
+            if (preparedTiles.isEmpty()) {
+                if (dispatcher.getPendingCount() > 0) {
+                    virtualThreadExecutor.submit(this::pumpBatchOrchestration);
+                }
+                return;
+            }
+            notifyBatchStart(preparedTiles.size(), cwnd);
+            transmitPreparedTiles(preparedTiles);
         } finally {
             isDispatching.set(false);
         }
@@ -107,6 +147,19 @@ public final class ClientSession {
 
     private boolean canTransmit() {
         return dataConnection != null && dataConnection.isOpen();
+    }
+
+    private List<PreparedTile> prepareValidTiles(List<TileDispatcher.TileTask> batch) {
+        List<PreparedTile> list = new java.util.ArrayList<>(batch.size());
+        for (TileDispatcher.TileTask task : batch) {
+            if (!isTaskEpochStale(task.epoch())) {
+                byte[] jpeg = tileManager.getTile(task.zoom(), task.tileX(), task.tileY());
+                if (jpeg != null) {
+                    list.add(new PreparedTile(task, jpeg));
+                }
+            }
+        }
+        return list;
     }
 
     private void notifyBatchStart(int batchSize, int cwnd) {
@@ -119,26 +172,15 @@ public final class ClientSession {
         }
     }
 
-    private void transmitBatch(List<TileDispatcher.TileTask> batch) {
-        for (TileDispatcher.TileTask task : batch) {
-            if (isTaskEpochStale(task.epoch())) {
-                continue; // Purged by epoch cancellation rule
-            }
-            sendSingleTileFrame(task);
+    private void transmitPreparedTiles(List<PreparedTile> preparedTiles) {
+        for (PreparedTile pt : preparedTiles) {
+            byte[] uhipFrame = UhipCodec.encodeTileData(pt.task.epoch(), pt.task.zoom(), pt.task.tileX(), pt.task.tileY(), pt.jpeg);
+            dataConnection.send(ByteBuffer.wrap(uhipFrame));
         }
     }
 
     private boolean isTaskEpochStale(int taskEpoch) {
         return taskEpoch < currentEpoch;
-    }
-
-    private void sendSingleTileFrame(TileDispatcher.TileTask task) {
-        byte[] jpeg = tileManager.getTile(task.zoom(), task.tileX(), task.tileY());
-        if (jpeg == null) {
-            return;
-        }
-        byte[] uhipFrame = UhipCodec.encodeTileData(task.epoch(), task.zoom(), task.tileX(), task.tileY(), jpeg);
-        dataConnection.send(ByteBuffer.wrap(uhipFrame));
     }
 
     /**

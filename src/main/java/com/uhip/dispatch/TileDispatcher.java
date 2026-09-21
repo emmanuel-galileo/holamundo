@@ -24,8 +24,11 @@ public final class TileDispatcher {
      * Orchestrator: Enqueues an entire viewport bounding box ordered by Manhattan distance.
      */
     public synchronized void enqueueViewport(int epoch, int zoom, int minX, int minY, int maxX, int maxY, int centerX, int centerY) {
-        syncEpoch(epoch);
+        if (isObsoleteEpoch(epoch)) {
+            return;
+        }
         clearStaleQueueIfEpochAdvanced(epoch);
+        syncEpoch(epoch);
         fillBoundingBox(epoch, zoom, minX, minY, maxX, maxY, centerX, centerY);
     }
 
@@ -61,6 +64,10 @@ public final class TileDispatcher {
     }
 
     // --- Sub-functions (Single-responsibility) ---
+
+    private boolean isObsoleteEpoch(int epoch) {
+        return epoch < this.currentEpoch;
+    }
 
     private void syncEpoch(int epoch) {
         if (epoch > this.currentEpoch) {

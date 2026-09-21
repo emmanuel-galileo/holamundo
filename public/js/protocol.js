@@ -79,6 +79,24 @@ export class ProtocolClient {
     handleBatchStart(msg) {
         this.currentBatchTotal = msg.count;
         this.currentBatchPending = msg.count;
+        this.startBatchWatchdog(msg.epoch || this.currentEpoch);
+    }
+
+    startBatchWatchdog(epoch) {
+        this.clearBatchWatchdog();
+        this.batchWatchdogTimer = setTimeout(() => {
+            if (this.currentBatchPending > 0) {
+                this.currentBatchPending = 0;
+                this.sendAckBatch(epoch, this.currentBatchTotal);
+            }
+        }, 120);
+    }
+
+    clearBatchWatchdog() {
+        if (this.batchWatchdogTimer) {
+            clearTimeout(this.batchWatchdogTimer);
+            this.batchWatchdogTimer = null;
+        }
     }
 
     sendSyncView(bounds, epoch) {
@@ -149,22 +167,33 @@ export class ProtocolClient {
         const parsed = this.parseBinaryHeader(arrayBuffer);
         if (!parsed) return;
 
-        // Discard frame if belonging to an obsolete epoch, except for the immortal base root tile (0:0:0)
-        if (!this.isImmortalRootTile(parsed) && parsed.epoch < this.currentEpoch) {
+        const isImmortal = this.isImmortalOverviewTile(parsed);
+
+        // Discard frame if belonging to an obsolete epoch, except for immortal overview tiles (zoom <= 3)
+        if (!isImmortal && parsed.epoch < this.currentEpoch) {
+            this.checkBatchCompletion(parsed.epoch);
             return;
         }
 
-        const bitmap = await this.decodeJpegBitmap(parsed.jpegBytes);
-        if (bitmap) {
-            const key = `${parsed.zoom}:${parsed.tileX}:${parsed.tileY}`;
-            this.cache.set(key, bitmap);
-            this.notifyTileArrived(key);
-            this.checkBatchCompletion(parsed.epoch);
+        try {
+            const bitmap = await this.decodeJpegBitmap(parsed.jpegBytes);
+            if (bitmap) {
+                const key = `${parsed.zoom}:${parsed.tileX}:${parsed.tileY}`;
+                if (isImmortal) {
+                    this.cache.markImmortal(key);
+                }
+                this.cache.set(key, bitmap);
+                this.notifyTileArrived(key);
+            }
+        } finally {
+            if (!isImmortal) {
+                this.checkBatchCompletion(parsed.epoch);
+            }
         }
     }
 
-    isImmortalRootTile(parsed) {
-        return parsed.zoom === 0 && parsed.tileX === 0 && parsed.tileY === 0;
+    isImmortalOverviewTile(parsed) {
+        return parsed.epoch === 0 || parsed.zoom <= 3;
     }
 
     parseBinaryHeader(buffer) {
@@ -207,6 +236,7 @@ export class ProtocolClient {
         if (this.currentBatchPending > 0) {
             this.currentBatchPending--;
             if (this.currentBatchPending === 0) {
+                this.clearBatchWatchdog();
                 this.sendAckBatch(epoch, this.currentBatchTotal);
             }
         }
