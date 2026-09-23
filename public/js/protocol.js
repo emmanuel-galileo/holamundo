@@ -21,9 +21,12 @@ export class ProtocolClient {
         this.currentBatchPending = 0;
         this.currentBatchTotal = 0;
 
-        this.lastCwnd = 1;
-        this.lastSsthresh = 16;
-        this.inSlowStart = true;
+        this.lastCwnd = 32;
+        this.algorithm = 'TCP_VEGAS';
+        this.rtt = 0;
+        this.baseRtt = 0;
+        this.diff = 0.0;
+        this.pending = 0;
     }
 
     /**
@@ -65,9 +68,12 @@ export class ProtocolClient {
     }
 
     updateCwndTelemetry(msg) {
-        this.lastCwnd = msg.cwnd;
-        this.lastSsthresh = msg.ssthresh;
-        this.inSlowStart = msg.inSlowStart;
+        this.lastCwnd = (msg.cwnd !== undefined) ? msg.cwnd : this.lastCwnd;
+        this.algorithm = msg.algorithm || 'TCP_VEGAS';
+        this.rtt = (msg.rtt !== undefined) ? msg.rtt : 0;
+        this.baseRtt = (msg.baseRtt !== undefined) ? msg.baseRtt : 0;
+        this.diff = (msg.diff !== undefined) ? msg.diff : 0.0;
+        this.pending = (msg.pending !== undefined) ? msg.pending : 0;
         if (msg.maxZoom !== undefined) {
             this.maxZoom = msg.maxZoom;
         }

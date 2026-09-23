@@ -94,13 +94,13 @@ public class TestUhipClient {
             System.err.println("[TEST] FAILURE: No tile received within timeout.");
         }
 
-        // 4. Send ACK_BATCH to verify CWND progression
-        System.out.println("[TEST] Sending ACK_BATCH to trigger Slow Start...");
+        // 4. Send ACK_BATCH to verify TCP Vegas CWND progression
+        System.out.println("[TEST] Sending ACK_BATCH to trigger TCP Vegas window adjustment...");
         controlClient.send("{\"type\":\"ACK_BATCH\",\"epoch\":1,\"count\":1}");
         Thread.sleep(500);
 
-        // 5. Send ABORT to verify Multiplicative Decrease
-        System.out.println("[TEST] Sending ABORT to trigger Multiplicative Decrease...");
+        // 5. Send ABORT to verify Vegas window stabilization
+        System.out.println("[TEST] Sending ABORT to verify TCP Vegas window preservation...");
         controlClient.send("{\"type\":\"ABORT\",\"epoch\":1}");
         Thread.sleep(500);
 

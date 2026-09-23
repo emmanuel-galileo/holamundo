@@ -12,6 +12,9 @@ export class TelemetryHud {
             cwndPhase: document.getElementById('stat-phase'),
             cwndBar: document.getElementById('bar-cwnd'),
             ssthresh: document.getElementById('stat-ssthresh'),
+            rtt: document.getElementById('stat-rtt'),
+            baseRtt: document.getElementById('stat-basertt'),
+            diff: document.getElementById('stat-diff'),
             pending: document.getElementById('stat-pending'),
             cacheCount: document.getElementById('stat-cache-count'),
             cacheBar: document.getElementById('bar-cache'),
@@ -101,22 +104,28 @@ export class TelemetryHud {
         if (!this.dom.cwndValue) return;
 
         const cwnd = protocol.lastCwnd;
-        const ssthresh = protocol.lastSsthresh;
-        const inSlowStart = protocol.inSlowStart;
+        const rtt = protocol.rtt || 0;
+        const baseRtt = protocol.baseRtt || 0;
+        const diff = (protocol.diff !== undefined) ? protocol.diff : 0.0;
+        const pending = (protocol.pending !== undefined) ? protocol.pending : 0;
 
         this.dom.cwndValue.textContent = cwnd;
-        this.dom.ssthresh.textContent = ssthresh;
 
-        if (inSlowStart) {
-            this.dom.cwndPhase.textContent = 'SLOW START';
-            this.dom.cwndPhase.className = 'metric-tag slow-start';
-        } else {
-            this.dom.cwndPhase.textContent = 'AIMD AVOID';
-            this.dom.cwndPhase.className = 'metric-tag congestion-avoidance';
+        if (this.dom.cwndPhase) {
+            this.dom.cwndPhase.textContent = 'TCP VEGAS';
+            this.dom.cwndPhase.className = 'metric-tag tcp-vegas';
         }
 
-        const percentage = Math.min(100, Math.round((cwnd / 64) * 100));
-        this.dom.cwndBar.style.width = `${Math.max(3, percentage)}%`;
+        if (this.dom.rtt) this.dom.rtt.textContent = rtt;
+        if (this.dom.baseRtt) this.dom.baseRtt.textContent = baseRtt;
+        if (this.dom.diff) this.dom.diff.textContent = typeof diff === 'number' ? diff.toFixed(2) : diff;
+        if (this.dom.pending) this.dom.pending.textContent = pending;
+        if (this.dom.ssthresh) this.dom.ssthresh.textContent = baseRtt;
+
+        const percentage = Math.min(100, Math.round((cwnd / 256) * 100));
+        if (this.dom.cwndBar) {
+            this.dom.cwndBar.style.width = `${Math.max(3, percentage)}%`;
+        }
     }
 
     updateCacheMetrics(cache) {

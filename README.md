@@ -67,7 +67,7 @@ Proyecto Imagenes CC8/
 │   ├── session/
 │   │   ├── ClientSession.java  # Pipeline de despacho por cliente
 │   │   └── SessionManager.java # Registro concurrente de sesiones
-│   ├── traffic/TrafficEngine.java# Máquina de estados Slow Start + AIMD
+│   ├── traffic/TrafficEngine.java# Motor de congestión Capa 7 TCP Vegas (RTT y Diff)
 │   ├── dispatch/TileDispatcher.java # Cola de prioridad Manhattan
 │   ├── storage/TileManager.java# I/O de disco, caché SoftRef y generador sintético
 │   ├── protocol/UhipCodec.java # Serialización binaria UHIP v1.0
@@ -191,7 +191,7 @@ Cada tesela en el canal de datos se transmite en un frame binario con el siguien
 
 | Algoritmo | Componente | Descripción |
 |---|---|---|
-| **Slow Start + AIMD (Piso Operativo Localhost)** | `TrafficEngine.java` | Inicia con piso operativo `minCwnd=16` para despacho inmediato de viewport completo sub-20ms. En Slow Start se duplica por cada ACK (`cwnd *= 2`) hasta `ssthresh=32`. Luego pasa a Congestion Avoidance (`cwnd += 1`). Ante congestión o `ABORT`, aplica disminución multiplicativa respetando el piso: `ssthresh = max(minCwnd, cwnd/2)`, `cwnd = minCwnd`. |
+| **TCP Vegas en Capa 7 (Brakmo & Peterson)** | `TrafficEngine.java` | Regula CWND midiendo RTT por lote en lugar de esperar pérdidas. Compara throughput esperado ($CWND / baseRTT$) contra real ($CWND / actualRTT$) para estimar el volumen de cola $Diff$. Con $\alpha=2.0$ y $\beta=5.0$, acelera aditivamente si $Diff < \alpha$, desacelera si $Diff > \beta$ y estabiliza la ventana en equilibrio óptimo ($min=16, init=32, max=256$). Preserva ventana ante `ABORT`. |
 | **Cola Manhattan** | `TileDispatcher.java` | Prioridad $= \|tileX - centerX\| + \|tileY - centerY\|$. Las teselas centrales se transmiten primero. Purga instantánea de cola en `clearStaleQueueIfEpochAdvanced` antes de sincronizar época. |
 | **Calibración de Nitidez & Zoom Inercial** | `viewport.js` | Densidad de píxeles calibrada: promueve a $z+1$ si el estiramiento supera $1.25\times$ y asegura nivel Cover que iguala o supera la resolución del monitor (ej. Nivel 3 de 2048 px para 1080p). Amortiguación `lerp(0.15)` e inercia cinemática amortiguada. |
 | **Relevo Visual Continuo (Sin caída a L0)** | `renderer.js` | Durante transiciones de zoom, retiene dibujadas las teselas del último nivel estable escaladas en Canvas y prohíbe sustituir el lienzo por L0 si existe cualquier nivel intermedio en memoria. |

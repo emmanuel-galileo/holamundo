@@ -52,35 +52,55 @@ public final class Main {
             );
         }
         if (args.length >= 1) {
-            Path cliPath = ServerConfig.sanitizePath(args[0], "tiles");
+            Path cliPath = ServerConfig.sanitizePath(args[0], ".");
             if (isValidTilesDirectory(cliPath)) {
                 return ServerConfig.fromTilesPath(args[0]);
             }
-            System.err.printf("[ERROR] La ruta especificada por CLI no existe o no es un directorio: %s\n", cliPath);
-            System.err.println("[UHIP] Iniciando solicitud interactiva...");
+            System.err.printf("[WARN] La ruta especificada por CLI no es un directorio accesible: %s\n", cliPath);
         }
+
+        // Auto-discover if there is an existing tiles dataset folder (e.g. *_tiles or directory with metadata.json)
+        Path discovered = discoverDatasetDirectory();
+        if (discovered != null) {
+            System.out.printf("[UHIP] Dataset de teselas detectado automáticamente: %s\n", discovered);
+            return ServerConfig.fromTilesPath(discovered.toString());
+        }
+
         return promptInteractiveConfig();
+    }
+
+    private static Path discoverDatasetDirectory() {
+        try (var stream = Files.list(Path.of("."))) {
+            java.util.List<Path> candidates = stream
+                    .filter(Files::isDirectory)
+                    .filter(dir -> Files.exists(dir.resolve("metadata.json")) || Files.isDirectory(dir.resolve("0")))
+                    .toList();
+            if (candidates.size() == 1) {
+                return candidates.get(0);
+            }
+        } catch (IOException ignored) {}
+        return null;
     }
 
     private static ServerConfig promptInteractiveConfig() {
         BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
         while (true) {
-            System.out.print("[UHIP] Ingrese la ruta de la carpeta de teselas [Enter para usar './tiles']: ");
+            System.out.print("[UHIP] Ingrese la ruta de la carpeta de teselas (o Enter para modo espera): ");
             try {
                 String line = reader.readLine();
-                if (line == null) {
+                if (line == null || line.trim().isEmpty()) {
                     return ServerConfig.createDefault();
                 }
-                Path path = ServerConfig.sanitizePath(line, "tiles");
+                Path path = ServerConfig.sanitizePath(line, ".");
                 if (isValidTilesDirectory(path)) {
                     return ServerConfig.fromTilesPath(path.toString());
                 }
                 System.err.printf("[ERROR] La ruta no existe o no es un directorio: %s\n", path);
                 System.out.print("[UHIP] Desea intentar otra ruta? (S/n): ");
                 String retry = reader.readLine();
-                if (retry == null || retry.trim().equalsIgnoreCase("n")) {
-                    System.out.println("[UHIP] Inicio cancelado por el usuario.");
-                    System.exit(1);
+                if (retry != null && retry.trim().equalsIgnoreCase("n")) {
+                    System.out.println("[UHIP] Iniciando servidor en modo espera...");
+                    return ServerConfig.createDefault();
                 }
             } catch (IOException e) {
                 return ServerConfig.createDefault();
@@ -97,17 +117,19 @@ public final class Main {
         int maxZoom = tileManager.detectMaxZoom();
         TileManager.ImageDimensions dims = tileManager.detectImageDimensions();
 
-        System.out.println("[OK] Ruta configurada: " + path);
-        System.out.printf("[OK] Niveles de zoom detectados: 0 a %d\n", maxZoom);
-        if (tileManager.isMetadataJsonLoaded()) {
-            System.out.printf("[OK] Metadata cargada: %d x %d px (desde metadata.json)\n",
-                    dims.originalWidth(), dims.originalHeight());
+        if (Files.exists(path) && (Files.exists(path.resolve("metadata.json")) || Files.isDirectory(path.resolve("0")))) {
+            System.out.println("[OK] Ruta de teselas configurada: " + path);
+            System.out.printf("[OK] Niveles de zoom detectados: 0 a %d\n", maxZoom);
+            if (tileManager.isMetadataJsonLoaded()) {
+                System.out.printf("[OK] Metadata cargada: %d x %d px (desde metadata.json)\n",
+                        dims.originalWidth(), dims.originalHeight());
+            } else {
+                System.out.printf("[OK] Dimensiones estimadas: %d x %d px (%d niveles)\n",
+                        dims.originalWidth(), dims.originalHeight(), maxZoom + 1);
+            }
         } else {
-            System.out.printf("[OK] Dimensiones estimadas: %d x %d px (%d niveles)\n",
-                    dims.originalWidth(), dims.originalHeight(), maxZoom + 1);
-        }
-        if (!Files.isDirectory(path.resolve("0"))) {
-            System.err.println("[WARN] No se detecto la subcarpeta base '0' en la ruta de teselas.");
+            System.out.println("[UHIP] Directorio de teselas activo: " + path);
+            System.out.println("[UHIP] Servidor listo. Procese imágenes usando: python tools/slice_large_image.py");
         }
     }
 
@@ -164,7 +186,7 @@ public final class Main {
         System.out.printf("   Public Directory:  %s\n", config.publicDir().toAbsolutePath());
         System.out.println("==================================================================");
         System.out.println("   Virtual Threads:  ENABLED (Executors.newVirtualThreadPerTaskExecutor)");
-        System.out.println("   Congestion Ctrl:  ENABLED (Slow Start + AIMD)");
+        System.out.println("   Congestion Ctrl:  ENABLED (TCP Vegas L7 - Brakmo & Peterson)");
         System.out.println("   Ready for connections. Press Ctrl+C to terminate.");
         System.out.println("==================================================================");
     }

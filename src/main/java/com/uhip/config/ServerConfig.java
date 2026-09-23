@@ -31,9 +31,12 @@ public record ServerConfig(
      */
     public static Path sanitizePath(String input, String fallback) {
         String target = (input != null && !input.isBlank()) ? input : fallback;
+        if (target == null || target.isBlank()) {
+            return Path.of(".").toAbsolutePath().normalize();
+        }
         String clean = target.replace("\"", "").trim();
         if (clean.isBlank()) {
-            clean = fallback;
+            clean = (fallback != null && !fallback.isBlank()) ? fallback : ".";
         }
         return Path.of(clean).toAbsolutePath().normalize();
     }
@@ -42,7 +45,7 @@ public record ServerConfig(
      * Factory method creating a default production configuration.
      */
     public static ServerConfig createDefault() {
-        return fromTilesPath("tiles");
+        return fromTilesPath(".");
     }
 
     /**
@@ -54,7 +57,7 @@ public record ServerConfig(
                 DEFAULT_WS_CONTROL_PORT,
                 DEFAULT_WS_DATA_PORT,
                 DEFAULT_TILE_SIZE,
-                sanitizePath(tilesPathInput, "tiles"),
+                sanitizePath(tilesPathInput, "."),
                 sanitizePath("public", "public"),
                 DEFAULT_INITIAL_CWND,
                 DEFAULT_INITIAL_SSTHRESH,

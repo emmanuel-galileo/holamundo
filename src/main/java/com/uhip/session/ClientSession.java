@@ -136,6 +136,7 @@ public final class ClientSession {
                 }
                 return;
             }
+            trafficEngine.recordBatchStart();
             notifyBatchStart(preparedTiles.size(), cwnd);
             transmitPreparedTiles(preparedTiles);
         } finally {
@@ -204,9 +205,11 @@ public final class ClientSession {
         if (controlConnection != null && controlConnection.isOpen()) {
             TrafficEngine.Snapshot snap = trafficEngine.getSnapshot();
             int maxZoom = tileManager.detectMaxZoom();
+            double roundedDiff = Math.round(snap.diff() * 100.0) / 100.0;
             String json = String.format(
-                    "{\"type\":\"CWND_UPDATE\",\"cwnd\":%d,\"ssthresh\":%d,\"inSlowStart\":%b,\"pending\":%d,\"maxZoom\":%d}",
-                    snap.cwnd(), snap.ssthresh(), snap.inSlowStart(), dispatcher.getPendingCount(), maxZoom
+                    java.util.Locale.US,
+                    "{\"type\":\"CWND_UPDATE\",\"algorithm\":\"%s\",\"cwnd\":%d,\"rtt\":%d,\"baseRtt\":%d,\"diff\":%.2f,\"pending\":%d,\"maxZoom\":%d}",
+                    snap.algorithm(), snap.cwnd(), snap.rtt(), snap.baseRtt(), roundedDiff, dispatcher.getPendingCount(), maxZoom
             );
             controlConnection.send(json);
         }

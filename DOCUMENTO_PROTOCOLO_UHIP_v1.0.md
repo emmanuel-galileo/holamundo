@@ -307,14 +307,16 @@ Emitido por el cliente ante una interrupción abrupta de la navegación para can
 ```
 
 ### 5.6 Mensaje `CWND_UPDATE` (Servidor $\to$ Cliente)
-Emitido periódicamente para telemetría de rendimiento y control en el cliente:
+Emitido periódicamente para telemetría de rendimiento y control en el cliente bajo el algoritmo TCP Vegas:
 ```json
 {
   "type": "CWND_UPDATE",
-  "cwnd": 64,
-  "ssthresh": 128,
-  "inSlowStart": false,
-  "pending": 12,
+  "algorithm": "TCP_VEGAS",
+  "cwnd": 32,
+  "rtt": 8,
+  "baseRtt": 8,
+  "diff": 0.00,
+  "pending": 0,
   "maxZoom": 8
 }
 ```
@@ -371,60 +373,64 @@ El ciclo de vida del cliente y el servidor UHIP v1.0 se modela mediante una Máq
 | `HANDSHAKE_INIT` | Recepción de `IMAGE_INFO` | Metadatos válidos ($W>0, H>0$) | Configuración de dimensiones y cálculo de Cover Floor | `PRELOAD_BASE` |
 | `PRELOAD_BASE` | Recepción de 85 teselas base | `epoch == 0` y $z \in [0..3]$ | Registro incondicional en memoria RAM como inmortales | `IDLE_NAVIGATING` |
 | `IDLE_NAVIGATING`| Desplazamiento de cámara o zoom | Coordenadas fuera de caché local | Envío de `SYNC_VIEW`, cálculo foveal Manhattan | `STREAMING_BATCH` |
-| `STREAMING_BATCH`| Recepción completa de lote | `pending == 0` | Envío de `ACK_BATCH`, incremento CWND (AIMD) | `IDLE_NAVIGATING` |
+| `STREAMING_BATCH`| Recepción completa de lote | `pending == 0` | Envío de `ACK_BATCH`, ajuste ventana TCP Vegas | `IDLE_NAVIGATING` |
 | `STREAMING_BATCH`| Salto de zoom o pulsación Abort | `epoch_new > epoch_active` | Purgado de cola en servidor, cancelación de tramas | `IDLE_NAVIGATING` |
 
 ---
 
-## 7. Control de Congestión y Gestión de Tráfico en Capa 7 (RFC 5681)
+## 7. Control de Congestión y Gestión de Tráfico en Capa 7: Algoritmo TCP Vegas
 
-### 7.1 Adaptación del Algoritmo AIMD en Nivel de Aplicación
+### 7.1 Regulación Basada en Retardo RTT y Volumen de Cola (Brakmo & Peterson, 1994)
 
-Para evitar el desbordamiento de los buffers internos de los navegadores (*Bufferbloat*) y asegurar tiempos de reacción instantáneos, UHIP v1.0 no delega ciegamente el control de flujo en TCP: implementa una máquina **AIMD (Additive Increase / Multiplicative Decrease)** en la Capa de Aplicación gobernando la cantidad máxima de teselas transmitidas en cada ráfaga (`CWND`).
+Para evitar el desbordamiento de los buffers internos de los navegadores (*Bufferbloat*) y asegurar tiempos de reacción instantáneos, UHIP v1.0 reemplaza los esquemas reactivos de pérdida de paquetes por el algoritmo formal **TCP Vegas** en la Capa de Aplicación. En lugar de forzar pérdidas para detectar saturación, TCP Vegas mide el tiempo de ida y vuelta (*Round-Trip Time*, RTT) de cada ráfaga de teselas, compara el rendimiento esperado contra el real y calcula de forma continua el volumen de cola en tránsito (*Diff*):
 
 ```
-                VENTANA DE CONGESTIÓN (CWND) EN UHIP v1.0
-  CWND
-   |                                     /\ (Congestión / Backpressure)
-256|                                    /     |                                   /    \ Multiplicative Decrease
-   |                                  /      +---------------- ssthresh
-   |                  /\             /
-   |                 /  \           /
-128|----------------+    \  AIMD   /
-   |               /|     +-------+ (Congestion Avoidance: CWND = CWND + 1)
-   |  Slow Start  / |     |
- 64|  (CWND *= 2)/  |     |
- 32|------------+   |     |
-   +----------------+-----+-----------------------------------------> Lotes (ACKs)
+                     DINÁMICA DE VENTANA TCP VEGAS EN UHIP v1.0
+  Diff (Teselas en Cola)
+    |
+    |                                   Diff > beta (5.0) -> Cola saturándose:
+    |                           /\      CWND = max(MIN_CWND, CWND - 1)
+ beta = 5.0 |--------------------------/--\---------------------------------------
+    |                         /    \    Equilibrio Estable (alpha <= Diff <= beta):
+    |                        /      \   CWND constante (rendimiento óptimo)
+alpha = 2.0 |---------------+--------+--------------------------------------------
+    |              /                    Diff < alpha (2.0) -> Cola vacía:
+    |             /                     CWND = min(MAX_CWND, CWND + 1)
+ 0.0+------------+--------------------------------------------------------> Tiempo
 ```
 
 #### Ecuaciones Matemáticas de Gobierno:
 
-1. **Fase de Inicio Lento (*Slow Start*):**  
-   Mientras $\text{CWND} < \text{ssthresh}$, la ventana se duplica exponencialmente por cada confirmación de lote exitosa:
-   $$\text{CWND}_{k+1} = \min(\text{CWND}_k \times 2, \text{ssthresh})$$
-   Al alcanzar o superar el umbral $\text{ssthresh}$, el motor conmuta automáticamente a Prevención de Congestión (`inSlowStart = false`).
+1. **Medición de Tiempos de Ida y Vuelta:**  
+   En cada ráfaga despachada, el servidor registra su marca de tiempo de salida $t_{\text{start}}$. Al recibir la confirmación `ACK_BATCH` del cliente, computa el RTT efectivo y actualiza el RTT base mínimo:
+   $$\text{actualRTT} = \max(1, t_{\text{ack}} - t_{\text{start}})$$
+   $$\text{baseRTT} = \begin{cases} \text{actualRTT}, & \text{si } \text{baseRTT} \le 0 \lor \text{actualRTT} < \text{baseRTT} \\ \text{baseRTT}, & \text{en otro caso} \end{cases}$$
 
-2. **Fase de Prevención de Congestión (*Congestion Avoidance* - Incremento Aditivo):**  
-   Cuando la conexión opera en régimen estable, la ventana crece de forma lineal y conservadora a razón de 1 tesela por cada lote confirmado:
-   $$\text{CWND}_{k+1} = \min(\text{CWND}_k + 1, \text{MAX\_CWND})$$
+2. **Cálculo de Rendimiento y Volumen de Cola (*Diff*):**  
+   Se determina el rendimiento esperado y el rendimiento real en función del número actual de teselas en tránsito ($\text{CWND}$):
+   $$\text{ExpectedThroughput} = \frac{\text{CWND}}{\text{baseRTT}}, \quad \text{ActualThroughput} = \frac{\text{CWND}}{\text{actualRTT}}$$
+   $$\text{Diff} = (\text{ExpectedThroughput} - \text{ActualThroughput}) \times \text{baseRTT} = \text{CWND} \times \left(1 - \frac{\text{baseRTT}}{\text{actualRTT}}\right)$$
 
-3. **Disminución Multiplicativa ante Congestión Real:**  
-   Ante una pérdida de paquetes comprobada o saturación física de buffers del socket:
-   $$\text{ssthresh} = \max\left(\text{MIN\_CWND}, \left\lfloor \frac{\text{CWND}_k}{2} \right\rfloor\right), \quad \text{CWND}_{k+1} = \text{MIN\_CWND}, \quad \text{inSlowStart} = \text{true}$$
+3. **Ajuste Preventivo Suave de la Ventana:**  
+   - Si $\text{Diff} < \alpha$ ($\alpha = 2.0$): La red y los buffers del cliente están subutilizados; se acelera de forma aditiva:
+     $$\text{CWND}_{k+1} = \min(\text{MAX\_CWND}, \text{CWND}_k + 1)$$
+   - Si $\text{Diff} > \beta$ ($\beta = 5.0$): Los buffers de recepción acumulan teselas; se frena preventivamente:
+     $$\text{CWND}_{k+1} = \max(\text{MIN\_CWND}, \text{CWND}_k - 1)$$
+   - Si $\alpha \le \text{Diff} \le \beta$: El enlace opera en régimen de equilibrio de máxima eficiencia; se mantiene $\text{CWND}_{k+1} = \text{CWND}_k$.
 
-4. **Desacoplamiento de Navegación vs. Pérdida (`onAbort`):**  
-   El cambio de coordenadas por movimiento del mouse **MUST NOT** activar la Disminución Multiplicativa. En UHIP v1.0, el evento `onAbort` purga las tareas pendientes de la época anterior pero preserva la ventana en su punto óptimo operativo:
-   $$\text{CWND}_{\text{abort}} = \max(\text{MIN\_CWND}, \min(\text{CWND}, \text{INITIAL\_SSTHRESH}))$$
+4. **Estabilización ante Navegación Cinemática (`onAbort`):**  
+   Las cancelaciones de época por desplazamiento del usuario (`onAbort`) no representan congestión de red, por lo que **MUST NOT** penalizar destructivamente la ventana:
+   $$\text{CWND}_{\text{abort}} = \max(\text{MIN\_CWND}, \text{CWND})$$
 
-### 7.2 Parámetros Calibrados para Transmisión en Red Local / Localhost
+### 7.2 Parámetros Calibrados para Streaming de Teselas en Capa 7
 
 | Parámetro | Valor Calibrado | Justificación Técnica |
 | :--- | :---: | :--- |
-| `MIN_CWND` | **32 teselas** | Garantiza que la primera ráfaga cubra de inmediato el área focal de la pantalla. |
-| `INITIAL_CWND` | **64 teselas** | Permite transmitir una pantalla 1080p entera en una sola ráfaga sub-10ms. |
-| `INITIAL_SSTHRESH` | **128 teselas** | Umbral óptimo para cambiar de crecimiento exponencial a lineal. |
-| `MAX_CWND` | **256 teselas** | Acota el lote máximo a ~3 MB, impidiendo pausas por recolección de basura. |
+| `MIN_CWND` | **16 teselas** | Piso mínimo operativo para garantizar despacho inmediato sin latencia perceptual. |
+| `INITIAL_CWND` | **32 teselas** | Ventana inicial balanceada que cubre el foco de visualización desde el primer RTT. |
+| `MAX_CWND` | **256 teselas** | Límite superior que impide desbordamiento de memoria y pausas de recolección de basura. |
+| $\alpha$ (*Alpha*) | **2.0 teselas** | Umbral de subutilización: activa el incremento aditivo cuando la cola en el cliente está vacía. |
+| $\beta$ (*Beta*) | **5.0 teselas** | Umbral de saturación: frena suavemente antes de provocar contención de buffers en el navegador. |
 
 ### 7.3 Algoritmo de Priorización Espacial Foveal (Métrica de Manhattan)
 
@@ -662,12 +668,13 @@ Las pruebas de rendimiento se ejecutaron en una estación de trabajo representat
 4. **RFC 2119:** Bradner, S. (1997). *Key words for use in RFCs to Indicate Requirement Levels*. IETF RFC 2119. https://www.rfc-editor.org/rfc/rfc2119
 5. **RFC 2326:** Schulzrinne, H., Rao, A., & Lanphier, R. (1998). *Real Time Streaming Protocol (RTSP)*. IETF RFC 2326. https://www.rfc-editor.org/rfc/rfc2326
 6. **RFC 5681:** Allman, M., Paxson, V., & Blanton, E. (2009). *TCP Congestion Control*. IETF RFC 5681. https://www.rfc-editor.org/rfc/rfc5681
-7. **RFC 6455:** Fette, I., & Melnikov, A. (2011). *The WebSocket Protocol*. IETF RFC 6455. https://www.rfc-editor.org/rfc/rfc6455
-8. **RFC 9000:** Iyengar, J., & Thomson, M. (2021). *QUIC: A UDP-Based Multiplexed and Secure Transport*. IETF RFC 9000. https://www.rfc-editor.org/rfc/rfc9000
-9. **RFC 9112:** Fielding, R., Nottingham, M., & Reschke, J. (2022). *HTTP/1.1*. IETF RFC 9112. https://www.rfc-editor.org/rfc/rfc9112
-10. **International Image Interoperability Framework (IIIF):** Snydman, M., Sanderson, R., & Cramer, T. (2020). *IIIF Image API 3.0*. https://iiif.io/api/image/3.0/
-11. **Adobe Systems Incorporated:** (2019). *Adobe Photoshop File Formats Specification (PSD & PSB)*. Adobe Developer Documentation.
-12. **W3C Recommendation:** Cabanier, R., & Wiltzius, T. (2021). *HTML Canvas 2D Context*. World Wide Web Consortium (W3C). https://www.w3.org/TR/2dcontext/
+7. **Brakmo, L. S., & Peterson, L. L. (1994):** *TCP Vegas: New Techniques for Congestion Detection and Avoidance*. Proceedings of the ACM SIGCOMM '94 Conference on Communications Architectures, Protocols and Applications, pp. 24–35.
+8. **RFC 6455:** Fette, I., & Melnikov, A. (2011). *The WebSocket Protocol*. IETF RFC 6455. https://www.rfc-editor.org/rfc/rfc6455
+9. **RFC 9000:** Iyengar, J., & Thomson, M. (2021). *QUIC: A UDP-Based Multiplexed and Secure Transport*. IETF RFC 9000. https://www.rfc-editor.org/rfc/rfc9000
+10. **RFC 9112:** Fielding, R., Nottingham, M., & Reschke, J. (2022). *HTTP/1.1*. IETF RFC 9112. https://www.rfc-editor.org/rfc/rfc9112
+11. **International Image Interoperability Framework (IIIF):** Snydman, M., Sanderson, R., & Cramer, T. (2020). *IIIF Image API 3.0*. https://iiif.io/api/image/3.0/
+12. **Adobe Systems Incorporated:** (2019). *Adobe Photoshop File Formats Specification (PSD & PSB)*. Adobe Developer Documentation.
+13. **W3C Recommendation:** Cabanier, R., & Wiltzius, T. (2021). *HTML Canvas 2D Context*. World Wide Web Consortium (W3C). https://www.w3.org/TR/2dcontext/
 
 ---
 *Fin de la Especificación Formal de Protocolo UHIP v1.0 - Documento Oficial de Entrega Académica.*

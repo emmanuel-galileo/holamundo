@@ -44,17 +44,17 @@
 
             <!-- Realtime Metrics Grid -->
             <section class="metrics-grid">
-                <!-- CWND Congestion Window -->
+                <!-- CWND Congestion Window (TCP Vegas) -->
                 <div class="metric-card" id="card-cwnd">
-                    <div class="metric-label">Ventana Congestión (CWND)</div>
+                    <div class="metric-label">Control de Congestión (Capa 7)</div>
                     <div class="metric-value-row">
-                        <span id="stat-cwnd" class="metric-value">1</span>
-                        <span id="stat-phase" class="metric-tag slow-start">SLOW START</span>
+                        <span id="stat-cwnd" class="metric-value">32</span>
+                        <span id="stat-phase" class="metric-tag tcp-vegas">TCP VEGAS</span>
                     </div>
                     <div class="bar-track">
-                        <div id="bar-cwnd" class="bar-fill" style="width: 2%;"></div>
+                        <div id="bar-cwnd" class="bar-fill cyan" style="width: 12%;"></div>
                     </div>
-                    <div class="metric-sub">ssthresh: <span id="stat-ssthresh">16</span> | encoladas: <span id="stat-pending">0</span></div>
+                    <div class="metric-sub" id="stat-vegas-sub">RTT: <span id="stat-rtt">0</span> ms | Base: <span id="stat-basertt">0</span> ms | Diff: <span id="stat-diff">0.00</span> | Pend: <span id="stat-pending">0</span></div>
                 </div>
 
                 <!-- Client Memory & LRU Cache -->
