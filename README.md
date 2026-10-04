@@ -106,54 +106,75 @@ build.bat
 ```
 *(O en PowerShell: `.\build.ps1`)*
 
-### 2. Generar Pirámide de Teselas
+### 2. Generar Pirámide de Teselas (100% Nativo en Java)
 
-#### A) Imagen Gigante Real (como `eso1242a.tif` de 4.2 GB o 24.6 GB)
-Se incluye el cortador de alto rendimiento para formatos TIFF, BigTIFF, PSB, PSD, PNG y JPG con **explorador nativo de Windows** y **generación automática de `metadata.json`**:
+El sistema ahora integra un cortador de alto rendimiento en Java que aprovecha el motor C/SIMD embebido `libvips 8.18` (sin requerir Python):
 
-- **Modo Interactivo / GUI (Doble clic o sin argumentos):**
+#### A) Desde el Menú Principal o Script de Corte
+- **Modo Interactivo / GUI (Doble clic en `cut-tiles.bat` o `run.bat` opción 2):**
   ```cmd
-  python tools/slice_large_image.py
+  cut-tiles.bat
   ```
-  Abre el selector nativo de Windows para escoger la imagen, detecta dimensiones (`width`, `height`), calcula el nivel nativo 1:1 (`auto_max_zoom = ceil(log2(max_dim / 256))`), crea la carpeta `{nombre_imagen}_tiles/` y genera su `metadata.json` automáticamente.
+  *(O en PowerShell: `.\cut-tiles.ps1`)*
+  Abre una ventana de explorador de Windows nativa para seleccionar cualquier imagen masiva (TIFF, BigTIFF, PSB, PSD, PNG, JPG), lee las dimensiones en 0.001s, ejecuta el corte multihilo por streaming (< 500 MB RAM) y genera automáticamente `metadata.json`. Al finalizar, **ofrece iniciar el servidor de inmediato**.
 
-- **Modo Línea de Comandos (Automatización):**
+- **Modo Línea de Comandos Directo:**
   ```cmd
-  python tools/slice_large_image.py eso1242a.tif tiles 8
+  cut-tiles.bat "C:\ruta\imagen.tif" "tiles_output"
   ```
-  *(Procesa la imagen a resolución nativa 1:1, generando teselas en `/tiles/{z}/{x}_{y}.jpg` y su `metadata.json` compatible con UHIP)*.
+  *(O: `java -jar target/uhip-server.jar --slice "C:\ruta\imagen.tif" "tiles_output"`)*
 
-#### B) Modo Sintético Procedural (Java TileCutter)
-Si no se cuenta con una imagen propia, el cortador en Java genera una pirámide de prueba con cuadrícula y coordenadas:
+#### B) Modo Sintético Procedural
+Para generar un dataset matemático de prueba con coordenadas visuales:
 ```cmd
-cut-tiles.bat --synthetic 4 tiles
+java -jar target/uhip-server.jar --synthetic 4 tiles
 ```
 
-### 3. Iniciar el Servidor
+---
 
-El servidor soporta **entrada híbrida de rutas de teselas** (ideal si el dataset está en un disco externo como `D:\` o `E:\`):
+### 3. Iniciar el Servidor (Selector Unificado y Soporte Multi-Cliente)
 
-#### Opción A: Argumento CLI directo (Sin pausas)
+Al ejecutar el servidor sin argumentos:
 ```cmd
-run.bat "D:\datasets\mi_imagen"
+run.bat
 ```
-*(O en PowerShell: `.\run.ps1 "D:\datasets\mi_imagen"` o `java -jar target/uhip-server.jar "D:\datasets\mi_imagen"`)*.
-Soporta automáticamente comillas envolventes de *"Copiar como ruta de acceso"* de Windows Explorer (`Ctrl+Shift+C`) y normaliza la ruta.
+*(O en PowerShell: `.\run.ps1`)*
 
-#### Opción B: Modo Interactivo (Doble clic en `run.bat` o sin argumentos)
-Si se ejecuta sin parámetros, el servidor solicitará la ruta en consola:
+Se presenta el **Selector Interactivo Unificado**:
 ```text
-[UHIP] Ingrese la ruta de la carpeta de teselas [Enter para usar './tiles']:
+==================================================================
+   UHIP v1.0 - Servidor Asíncrono de Imágenes Gigapíxel (Java 21) 
+==================================================================
+Seleccione el modo de operación:
+  [1] Iniciar Servidor UHIP (Servir imágenes a múltiples clientes web)
+  [2] Cortar / Procesar Imagen Masiva (Generador de Teselas VIPS)
+  [3] Generar Dataset Sintético de Prueba (Procedural)
+  [4] Salir
+==================================================================
 ```
-Al presionar `Enter` en blanco, utilizará `./tiles` por defecto.
+
+#### Opción 1: Iniciar Servidor
+- Si detecta automáticamente una carpeta con teselas (por ej. `./tiles` o `*_tiles`), pregunta si desea utilizarla directamente.
+- Si se prefiere otra, permite abrir una ventana de selección de carpetas de Windows o escribir la ruta en consola.
+- Permite también arranque directo por CLI:
+  ```cmd
+  run.bat "D:\datasets\mi_imagen_tiles"
+  ```
 
 #### Diagnóstico y Detección Automática
-Antes de abrir los puertos de red, el servidor valida el directorio, escanea los niveles numéricos (`0` a `N`) y, si existe un archivo `metadata.json`, lee las dimensiones reales (`width`, `height`, `tileSize`, `maxZoom`):
+Antes de abrir los puertos de red, el servidor valida el directorio, escanea los niveles numéricos (`0` a `N`) y lee las dimensiones reales desde `metadata.json`:
 ```text
-[OK] Ruta configurada: D:\datasets\mi_imagen
+[OK] Ruta de teselas configurada: D:\datasets\mi_imagen_tiles
 [OK] Niveles de zoom detectados: 0 a 8
 [OK] Metadata cargada: 40192 x 30208 px (desde metadata.json)
 ```
+
+#### Soporte Multi-Cliente Concurrente
+El servidor soporta múltiples navegadores o clientes independientes simultáneamente:
+- Cada cliente mantiene su propia sesión (`ClientSession`) con su propia cola de prioridad espacial Manhattan y época.
+- Cada cliente ajusta su ventana de despacho de manera independiente mediante el algoritmo TCP Vegas (Capa 7).
+- La memoria intermedia y la caché de teselas en disco son compartidas eficientemente entre todas las sesiones.
+- Al desconectarse un cliente, sus recursos son liberados automáticamente sin fugas de memoria.
 
 El servidor iniciará los siguientes servicios:
 - **Lienzo Web:** [http://localhost:8080/](http://localhost:8080/)

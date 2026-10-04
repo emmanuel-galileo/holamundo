@@ -53,6 +53,8 @@ public final class TileCutter {
         for (int z = 0; z <= maxZoom; z++) {
             generateZoomLevel(z, outDir);
         }
+        int dim = (1 << maxZoom) * TILE_SIZE;
+        writeMetadataJson(outDir, dim, dim, maxZoom);
     }
 
     private static void sliceSourceImageOrchestrator(Path sourceFile, Path outDir) throws IOException {
@@ -67,6 +69,19 @@ public final class TileCutter {
 
         for (int z = 0; z <= maxZoom; z++) {
             sliceLevelFromImage(source, z, outDir);
+        }
+        writeMetadataJson(outDir, source.getWidth(), source.getHeight(), maxZoom);
+    }
+
+    private static void writeMetadataJson(Path outDir, int width, int height, int maxZoom) {
+        String json = String.format(
+                "{\n  \"originalWidth\": %d,\n  \"originalHeight\": %d,\n  \"tileSize\": %d,\n  \"maxZoom\": %d\n}\n",
+                width, height, TILE_SIZE, maxZoom
+        );
+        try {
+            Files.writeString(outDir.resolve("metadata.json"), json);
+        } catch (IOException e) {
+            System.err.println("[WARN] No se pudo escribir metadata.json: " + e.getMessage());
         }
     }
 

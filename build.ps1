@@ -35,3 +35,13 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "Error empaquetando JAR." -ForegroundColor Red
     exit 1
 }
+
+# Compilar tests
+$testDir = "target/test-classes"
+if (!(Test-Path $testDir)) {
+    New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+}
+$testSources = (Get-ChildItem -Recurse -Filter "*.java" src/test/java -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+if ($testSources) {
+    javac -d $testDir -cp "target/uhip-server.jar;lib/*;src/main/java" $testSources
+}

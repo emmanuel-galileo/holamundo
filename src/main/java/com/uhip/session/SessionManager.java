@@ -40,7 +40,31 @@ public final class SessionManager {
      * Removes session upon disconnect.
      */
     public void removeSession(String clientId) {
-        sessions.remove(clientId);
+        ClientSession removed = sessions.remove(clientId);
+        if (removed != null) {
+            System.out.printf("[UHIP] Sesión liberada: %s | Clientes activos restantes: %d\n", clientId, sessions.size());
+        }
+    }
+
+    /**
+     * Returns total number of active client sessions.
+     */
+    public int getActiveSessionCount() {
+        return sessions.size();
+    }
+
+    /**
+     * Checks if both sockets of a session are closed/null, and cleans up if so.
+     */
+    public void checkAndCleanupSession(String clientId) {
+        ClientSession session = sessions.get(clientId);
+        if (session != null) {
+            boolean controlClosed = (session.getControlConnection() == null || session.getControlConnection().isClosed());
+            boolean dataClosed = (session.getDataConnection() == null || session.getDataConnection().isClosed());
+            if (controlClosed && dataClosed) {
+                removeSession(clientId);
+            }
+        }
     }
 
     /**
@@ -53,6 +77,7 @@ public final class SessionManager {
     // --- Sub-functions ---
 
     private ClientSession createNewSession(String clientId) {
+        System.out.printf("[UHIP] Nueva sesión creada: %s | Clientes registrados: %d\n", clientId, sessions.size() + 1);
         return new ClientSession(clientId, tileManager, virtualThreadExecutor);
     }
 }

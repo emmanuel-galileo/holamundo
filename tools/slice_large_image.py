@@ -3,6 +3,9 @@
 High-Performance Gigapixel Image Slicer for UHIP v1.0 (Embedded VIPS Engine).
 Supports 93 GB PNG, 25.8 GB PSB, BigTIFF, and all standard formats.
 Uses instant binary header probing and streaming multi-threaded dzsave.
+
+NOTA: Esta funcionalidad ahora está integrada de forma 100% nativa en Java:
+      Ejecute '.\run.ps1' (opción 2) o '.\cut-tiles.ps1' sin necesidad de Python.
 """
 
 import os

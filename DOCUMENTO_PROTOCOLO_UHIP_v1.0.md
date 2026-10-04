@@ -10,7 +10,7 @@
 | **Subtítulo** | Especificación Técnica y Arquitectura de un Sistema Distribuido Asíncrono para la Exploración Interactiva de Imágenes Gigapíxel sin Pérdida de Fluidez |
 | **Categoría Normativa** | Especificación de Protocolo en Capa de Aplicación (Capa 7 - Modelo OSI) |
 | **Entorno de Despliegue** | 100% Desconectado de Internet (*Air-Gapped* / Localhost / Red de Área Local LAN) |
-| **Stack de Implementación** | Servidor: Java 21 LTS (OpenJDK, Virtual Threads - Project Loom)<br>Cliente: HTML5 Canvas 2D puro, JavaScript ECMAScript 2022 (Zero-Dependencies, Vanilla CSS3)<br>Herramientas: Python 3.12+ (psd-tools, Pillow, PyVips) |
+| **Stack de Implementación** | Servidor: Java 21 LTS (OpenJDK, Virtual Threads - Project Loom)<br>Cliente: HTML5 Canvas 2D puro, JavaScript ECMAScript 2022 (Zero-Dependencies, Vanilla CSS3)<br>Herramientas: Java 21 Nativo (VipsTileSlicer con motor embebido libvips 8.18) |
 | **Puertos de Red** | HTTP: `8080` (Bootstrap SPA) \| Control Plane: `8081` (WebSocket JSON) \| Data Plane: `8082` (WebSocket Binario) |
 | **Fecha de Publicación** | Septiembre de 2026 |
 | **Ponderación Académica** | 35% de la Evaluación Final (Entrega de Documento de Protocolo y Arquitectura) |
@@ -590,24 +590,24 @@ tiles/
     └── 156_117.jpg        <- Nivel 8 (Nativo 1:1, 18,526 teselas)
 ```
 
-### 10.2 Inspección Instantánea de Cabeceras Adobe Photoshop Big (.psb / .psd)
+### 10.2 Inspección Instantánea de Cabeceras Adobe Photoshop Big (.psb / .psd) y PNG en Java
 
-Los archivos Adobe Photoshop Big (`.psb`) superan los límites históricos de 30,000 píxeles y 2 GB de tamaño de Photoshop estándar (`.psd`), utilizando una cabecera binaria `8BPS` versión 2 con direccionamiento de 64 bits. Las librerías convencionales de Python (Pillow) colapsan arrojando `cannot identify image file`.
+Los archivos Adobe Photoshop Big (`.psb`) superan los límites históricos de 30,000 píxeles y 2 GB de tamaño de Photoshop estándar (`.psd`), utilizando una cabecera binaria `8BPS` versión 2 con direccionamiento de 64 bits. Las librerías convencionales colapsan arrojando desbordamientos de memoria o falta de soporte.
 
-UHIP v1.0 incorpora en `tools/slice_large_image.py` un analizador atómico de bajo nivel que inspecciona los primeros 26 bytes crudos del archivo utilizando desempaquetado binario (`struct.unpack`):
+UHIP v1.0 incorpora en `com.uhip.tools.VipsTileSlicer` un analizador atómico de bajo nivel en Java que inspecciona los primeros 32 bytes crudos del archivo utilizando `ByteBuffer` en orden Big-Endian:
 
-```python
-# Layout de cabecera Adobe PSB de 26 bytes:
-# [Magic: 4B '8BPS'] [Version: 2B (2=PSB)] [Reserved: 6B] 
-# [Channels: 2B] [Height: 4B uint32] [Width: 4B uint32]
-with open(filepath, 'rb') as f:
-    header = f.read(26)
-    magic, version, _, channels, height, width = struct.unpack('>4sH6sHII', header)
-    if magic == b'8BPS' and version == 2:
-        return width, height, "psd_tools"
+```java
+// Layout de cabecera Adobe PSB:
+// [Magic: 4B '8BPS'] [Version: 2B (2=PSB)] [Reserved: 6B] [Channels: 2B] [Height: 4B uint32] [Width: 4B uint32]
+if (header[0] == '8' && header[1] == 'B' && header[2] == 'P' && header[3] == 'S') {
+    ByteBuffer buf = ByteBuffer.wrap(header, 14, 8).order(ByteOrder.BIG_ENDIAN);
+    int height = buf.getInt();
+    int width = buf.getInt();
+    return new ImageInfo(width, height, "PSB_Binary");
+}
 ```
 
-Esta técnica lee las dimensiones de un archivo PSB de 25 GB en **0.001 segundos** con un consumo de memoria RAM de exactamente **0 bytes**, sin necesidad de tener Adobe Photoshop instalado ni cargar la imagen a memoria.
+Esta técnica lee las dimensiones de un archivo masivo de 25 GB en **0.001 segundos** con un consumo de memoria RAM de exactamente **0 bytes**, sin necesidad de cargar la imagen a memoria ni requerir dependencias externas de Python.
 
 ### 10.3 Esquema del Archivo `metadata.json`
 

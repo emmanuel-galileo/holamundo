@@ -37,6 +37,7 @@ public final class ControlWebSocket extends WebSocketServer {
         String clientId = WsUtils.extractClientId(conn);
         ClientSession session = sessionManager.getOrCreateSession(clientId);
         session.setControlConnection(conn);
+        System.out.printf("[UHIP] Conexión Control activa: %s (Total clientes: %d)\n", clientId, sessionManager.getActiveSessionCount());
         session.sendImageInfo();
         session.broadcastTelemetry();
     }
@@ -48,6 +49,7 @@ public final class ControlWebSocket extends WebSocketServer {
         if (session != null && session.getControlConnection() == conn) {
             session.setControlConnection(null);
         }
+        sessionManager.checkAndCleanupSession(clientId);
     }
 
     @Override

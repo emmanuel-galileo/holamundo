@@ -1,11 +1,13 @@
-# Tile cutting script using TileCutter
-Write-Host "Ejecutando TileCutter..." -ForegroundColor Cyan
+# Tile cutting script using native Java VipsTileSlicer
+Write-Host "Iniciando Cortador de Teselas Nativo UHIP..." -ForegroundColor Cyan
+
+if (!(Test-Path "target/uhip-server.jar")) {
+    Write-Host "JAR no encontrado. Compilando primero..." -ForegroundColor Yellow
+    .\build.ps1
+}
 
 if ($args.Count -eq 0) {
-    Write-Host "Uso: .\cut-tiles.ps1 <ruta-imagen> [directorio-salida]"
-    Write-Host "O para generar dataset sintetico: .\cut-tiles.ps1 --synthetic [maxZoom] [directorio-salida]"
-    Write-Host "Generando dataset sintetico por defecto (Zooms 0-4 en 'tiles')..." -ForegroundColor Yellow
-    java -cp "target/classes;lib/*" com.uhip.tools.TileCutter --synthetic 4 tiles
+    java -jar target/uhip-server.jar --slice
 } else {
-    java -cp "target/classes;lib/*" com.uhip.tools.TileCutter $args
+    java -jar target/uhip-server.jar --slice $args
 }

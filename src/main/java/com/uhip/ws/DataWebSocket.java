@@ -32,6 +32,7 @@ public final class DataWebSocket extends WebSocketServer {
         String clientId = WsUtils.extractClientId(conn);
         ClientSession session = sessionManager.getOrCreateSession(clientId);
         session.setDataConnection(conn);
+        System.out.printf("[UHIP] Conexión Datos activa: %s (Total clientes: %d)\n", clientId, sessionManager.getActiveSessionCount());
         session.triggerDispatch();
     }
 
@@ -42,6 +43,7 @@ public final class DataWebSocket extends WebSocketServer {
         if (session != null && session.getDataConnection() == conn) {
             session.setDataConnection(null);
         }
+        sessionManager.checkAndCleanupSession(clientId);
     }
 
     @Override

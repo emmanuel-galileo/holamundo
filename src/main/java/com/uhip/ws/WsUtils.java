@@ -12,19 +12,27 @@ public final class WsUtils {
     private WsUtils() {}
 
     /**
-     * Extracts a clientId from query parameters or falls back to remote IP:port.
+     * Extracts a clientId from query parameters or falls back to unique connection attachment.
      */
     public static String extractClientId(WebSocket conn) {
         if (conn == null) {
-            return "unknown";
+            return "client_" + java.util.UUID.randomUUID().toString().substring(0, 8);
         }
         String descriptor = conn.getResourceDescriptor();
         if (descriptor != null && descriptor.contains("clientId=")) {
             int idx = descriptor.indexOf("clientId=") + 9;
             int amp = descriptor.indexOf('&', idx);
-            return (amp != -1) ? descriptor.substring(idx, amp) : descriptor.substring(idx);
+            String id = (amp != -1) ? descriptor.substring(idx, amp) : descriptor.substring(idx);
+            if (!id.isBlank()) {
+                return id.trim();
+            }
         }
-        InetSocketAddress address = conn.getRemoteSocketAddress();
-        return (address != null) ? address.getHostString() : "anonymous";
+        Object attachment = conn.getAttachment();
+        if (attachment instanceof String str && !str.isBlank()) {
+            return str;
+        }
+        String generated = "client_" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        conn.setAttachment(generated);
+        return generated;
     }
 }
