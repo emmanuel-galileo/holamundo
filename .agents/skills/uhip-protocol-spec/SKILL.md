@@ -8,14 +8,17 @@ description: Defines the complete binary specification and communication rules f
 Use this skill whenever implementing networking, packet handling, serialization, deserialization, or viewport/tile management.
 
 ## 1. Network & Byte Order Rules
-- **Transport Layer:** Encapsulated over WebSocket (RFC 6455) in Binary Frame mode (`0x02`).
+- **Transport Layer:** Dual-WebSocket Architecture:
+  - **Control Plane:** Text WebSocket on port 8081 (`/control?clientId=<id>`), JSON protocol.
+  - **Data Plane:** Binary WebSocket on port 8082 (`/data?clientId=<id>&generationId=<uuid>`), UHIP v1.0 binary framing (`0x02`).
+- **Paired Lifecycle:** Closing or error on either Control or Data socket immediately invalidates both sockets and triggers coordinated reconnection with exponential backoff (1s, 2s, 4s, max 8s).
 - **Byte Order (Endianness):** Strict Big-Endian (Network Byte Order, RFC 791).
 - **Serialization Tools:**
   - Java: Use `java.nio.ByteBuffer`.
-  - TypeScript/Angular: Use `ArrayBuffer` and `DataView`.
+  - Frontend/JavaScript: Use `ArrayBuffer`, `DataView`, and native `Uint8Array`.
 
 ## 2. Common Header Specification (Mandatory 12 Bytes)
-Every message (Client -> Server or Server -> Client) MUST start with this 12-byte header:
+Every binary message on the Data Plane MUST start with this 12-byte header:
 
     [0: Magic (uint8)]     -> 0x55 (ASCII 'U')
     [1: Version (uint8)]   -> 0x01
@@ -24,41 +27,96 @@ Every message (Client -> Server or Server -> Client) MUST start with this 12-byt
     [4-7: Epoch ID]        -> uint32 (Client viewport state revision)
     [8-11: Payload Length] -> uint32 (Byte count of trailing payload; 0 if no payload)
 
-Validation Rule: If `Magic != 0x55` or `Version != 0x01`, immediately discard frame and close/error connection.
+Validation Rule: If `Magic != 0x55` or `Version != 0x01`, immediately discard frame and close connection.
 
-## 3. OpCode Catalog & Payload Layouts
+## 3. Handshake & Session Negotiation Flow
 
-### 0x01: IMG_INIT_REQ (Client -> Server)
-- **Header:** `OpCode = 0x01`, `PayloadLength = string length in bytes`
-- **Payload:** UTF-8 string containing the image ID/name.
+1. **Client Open Control Socket:** Connects to `ws://<host>:8081/control?clientId=<id>`.
+2. **Client Sends `HELLO`:**
+   ```json
+   {
+     "type": "HELLO",
+     "clientVersion": "1.0",
+     "protocolProfile": "BATCH_STREAM_V2",
+     "clientId": "client_abc123",
+     "maxMemoryBytes": 134217728
+   }
+   ```
+3. **Server Responds `SESSION_READY`:** Generates unique String UUID `generationId` and provides image geometry metadata:
+   ```json
+   {
+     "type": "SESSION_READY",
+     "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+     "datasetId": "82fec56f-1f3f-4523-bd0b-ee2c742effe3",
+     "originalWidth": 2048,
+     "originalHeight": 2048,
+     "tileSize": 256,
+     "maxZoom": 3
+   }
+   ```
+4. **Client Connects Data Socket:** Connects to `ws://<host>:8082/data?clientId=<id>&generationId=<uuid>`.
+5. **Server Confirms `DATA_READY`:** Emitted on Control socket after pairing:
+   ```json
+   {
+     "type": "DATA_READY",
+     "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1"
+   }
+   ```
+6. **Client Sends `SYNC_VIEW`:** Initiates demand for visible tiles. The server session automatically guarantees bootstrapping of the universal root tile `0:0:0` (with priority 0) in the initial offer until resident-confirmed, eliminating visual holes.
 
-### 0x02: IMG_INIT_RES (Server -> Client)
-- **Header:** `OpCode = 0x02`, `PayloadLength = 14`
-- **Payload (14 bytes):**
-  - `[0-3]` `Width` (uint32)
-  - `[4-7]` `Height` (uint32)
-  - `[8-9]` `TileSize` (uint16) - Typically 256 or 512
-  - `[10]`  `MaxZoom` (uint8)
-  - `[11]`  `Format` (uint8) - `0x01` JPEG, `0x02` WebP
-  - `[12-13]` `Reserved` (uint16) - Alignment padding (0x0000)
+## 4. Credit Negotiation: BATCH_OFFER / ACCEPT / DEFER
 
-### 0x10: VIEWPORT_UPDATE (Client -> Server)
-- **Header:** `OpCode = 0x10`, `PayloadLength = 10`
-- **Payload (10 bytes):**
-  - `[0]`   `ZoomLevel` (uint8)
-  - `[1]`   `Reserved` (uint8)
-  - `[2-3]` `MinTileX` (uint16)
-  - `[4-5]` `MinTileY` (uint16)
-  - `[6-7]` `MaxTileX` (uint16)
-  - `[8-9]` `MaxTileY` (uint16)
+Before transmitting binary frames, the server sends a bounded offer over Control WS:
+```json
+{
+  "type": "BATCH_OFFER",
+  "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+  "batchId": 1,
+  "epoch": 1,
+  "candidates": [
+    { "key": "2:1:1", "zoom": 2, "tileX": 1, "tileY": 1, "jpegLength": 10322, "rasterBytes": 262144 }
+  ]
+}
+```
+Client validates candidates against managed budget ($R + T + J + D + G \le B$).
+- If credit can be reserved ($G$):
+  ```json
+  {
+    "type": "BATCH_ACCEPT",
+    "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+    "batchId": 1,
+    "grantId": 1,
+    "acceptedKeys": ["2:1:1"]
+  }
+  ```
+  *(Any unaccepted candidates in the offer are preserved and safely re-enqueued on the server for subsequent dispatch upon ACK).*
+- If capacity is exhausted:
+  ```json
+  {
+    "type": "BATCH_DEFER",
+    "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+    "batchId": 1,
+    "reason": "insufficient_budget"
+  }
+  ```
+  *(On deferral or offer timeout, all offered tasks are returned to the server's priority queue without loss).*
 
-### 0x11: TILE_REQ (Client -> Server)
-- **Header:** `OpCode = 0x11`, `PayloadLength = 6`
-- **Payload (6 bytes):**
-  - `[0]`   `ZoomLevel` (uint8)
-  - `[1]`   `Reserved` (uint8)
-  - `[2-3]` `TileX` (uint16)
-  - `[4-5]` `TileY` (uint16)
+## 5. Binary OpCode Catalog & Payload Layouts (Data Channel)
+
+### 0x13: BATCH_BEGIN (Server -> Client)
+- **Header:** `OpCode = 0x13`, `PayloadLength = 16 + (10 * plannedCount)`
+- **Payload:**
+  - `[0-3]` `BatchId` (uint32) - Monotonic batch identifier
+  - `[4-7]` `GrantId` (uint32) - Matching credit grant identifier
+  - `[8-9]` `PlannedCount` (uint16) - Number of tiles in this batch
+  - `[10-11]` `Reserved` (uint16)
+  - `[12-15]` `TotalJpegBytes` (uint32) - Total compressed payload size
+  - Item entries (10 bytes per item $\times$ `PlannedCount`):
+    - `[0]` `Zoom` (uint8)
+    - `[1]` `Reserved` (uint8)
+    - `[2-3]` `TileX` (uint16)
+    - `[4-5]` `TileY` (uint16)
+    - `[6-9]` `JpegLength` (uint32)
 
 ### 0x12: TILE_DATA (Server -> Client)
 - **Header:** `OpCode = 0x12`, `PayloadLength = 6 + N`
@@ -69,23 +127,65 @@ Validation Rule: If `Magic != 0x55` or `Version != 0x01`, immediately discard fr
   - `[4-5]` `TileY` (uint16)
   - `[6 ... 6+N-1]` `ImageBytes` (N bytes of raw compressed image)
 
-### 0x20: ABORT_EPOCH (Client -> Server)
-- **Header:** `OpCode = 0x20`, `PayloadLength = 4`
-- **Payload (4 bytes):**
-  - `[0-3]` `TargetEpoch` (uint32) - Cancel queued requests with `Epoch <= TargetEpoch`.
-
-### 0xFF: ERROR (Server -> Client)
-- **Header:** `OpCode = 0xFF`, `PayloadLength = 2 + message length`
+### 0x14: BATCH_END (Server -> Client)
+- **Header:** `OpCode = 0x14`, `PayloadLength = 8 + (8 * omittedCount)`
 - **Payload:**
-  - `[0-1]` `ErrorCode` (uint16)
-  - `[2...]` `ErrorMessage` (UTF-8 string)
+  - `[0-3]` `BatchId` (uint32) - Matching batch identifier
+  - `[4-5]` `SentCount` (uint16) - Successfully delivered tile count
+  - `[6-7]` `OmittedCount` (uint16) - Count of omitted tiles
+  - Item entries (8 bytes per item $\times$ `OmittedCount`):
+    - `[0]` `Zoom` (uint8)
+    - `[1]` `Reserved` (uint8)
+    - `[2-3]` `TileX` (uint16)
+    - `[4-5]` `TileY` (uint16)
+    - `[6]` `Reason` (uint8) - `0x01` Epoch Stale, `0x02` IO Error
+    - `[7]` `Reserved` (uint8)
 
-## 4. State & Memory Rules (Mandatory)
-1. **Epoch Cancellation (Server):**
-   - Whenever an `ABORT_EPOCH` is received, the server purges pending disk/transmission queues for older epochs.
-   - If a worker thread is about to send a tile whose `epoch < clientSession.latestEpoch`, it drops the task immediately.
-2. **LRU Eviction (Client):**
-   - The frontend maintains a strict limit (e.g., max 48 active tiles in memory).
-   - When switching zoom levels or panning away, out-of-view tiles must be explicitly destroyed (`ImageBitmap.close()` or removed from memory cache).
-3. **Offline Integrity:**
-   - No external requests, CDNs, or absolute third-party URLs. All resources, tiles, and scripts are relative and served locally.
+## 6. Strict ACK Ledger & Residency Sequencing
+
+### ACK_BATCH (Client -> Server)
+Emitted strictly once all asynchronous tile decodes are complete and terminal:
+```json
+{
+  "type": "ACK_BATCH",
+  "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+  "batchId": 1,
+  "epoch": 1,
+  "grantId": 1,
+  "sentCount": 1,
+  "omittedCount": 0,
+  "terminalResults": {
+    "2:1:1": "admitted"
+  },
+  "admittedKeys": ["2:1:1"],
+  "residencySeq": 1
+}
+```
+- Server rejects any ACK with missing terminal results, count mismatch, or stale generation.
+- `terminalResults` must contain exact partition of planned keys (`admitted`, `discarded`, `failed_decode`, or `omitted`).
+- `admittedKeys` is a strict subset of keys with status `admitted` currently resident in client cache.
+- Monotonic sequence `residencySeq` prevents late ACKs from resurrecting evicted tiles.
+
+### EVICT (Client -> Server)
+```json
+{
+  "type": "EVICT",
+  "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1",
+  "key": "2:1:1",
+  "residencySeq": 2
+}
+```
+- Removes key from server's `residentConfirmedKeys` filter.
+
+## 7. Managed Memory Budget Model
+
+- Total Budget: $B = 134,217,728$ bytes (128 MiB) and max 512 resident entries.
+- Managed Invariant:
+  $$R + T + J + D + G \le B$$
+  - $R$: Resident raster bytes ($4 \times W \times H$).
+  - $T$: Retired bitmaps awaiting frame borrow release.
+  - $J$: Compressed payload memory ($2L + 18$ bytes for buffer and Blob).
+  - $D$: Raster reserved for active decodes (max 4 concurrent decodes).
+  - $G$: Granted credit for accepted offers not yet materialized.
+- Transitions: Available $\to G \to J \to D \to R$.
+- On session reset: `retireGeneration()` closes all resident bitmaps, clears $G$, and preserves borrowed bitmaps in $T$ until frame completion.

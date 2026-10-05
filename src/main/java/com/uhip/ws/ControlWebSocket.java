@@ -9,12 +9,16 @@ import org.java_websocket.server.WebSocketServer;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * High-performance WebSocket server handling JSON control plane messages
- * (SYNC_VIEW, ACK_BATCH, ABORT, EVICT) using Java 21 Virtual Threads.
+ * WebSocket server handling JSON control plane messages
+ * (HELLO, SYNC_VIEW, BATCH_ACCEPT, BATCH_DEFER, ACK_BATCH, ABORT, EVICT).
  */
 public final class ControlWebSocket extends WebSocketServer {
 
@@ -28,9 +32,7 @@ public final class ControlWebSocket extends WebSocketServer {
     }
 
     @Override
-    public void onStart() {
-        // Ready to receive control connections
-    }
+    public void onStart() {}
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
@@ -38,16 +40,14 @@ public final class ControlWebSocket extends WebSocketServer {
         ClientSession session = sessionManager.getOrCreateSession(clientId);
         session.setControlConnection(conn);
         System.out.printf("[UHIP] Conexión Control activa: %s (Total clientes: %d)\n", clientId, sessionManager.getActiveSessionCount());
-        session.sendImageInfo();
-        session.broadcastTelemetry();
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
         String clientId = WsUtils.extractClientId(conn);
         ClientSession session = sessionManager.getSession(clientId);
-        if (session != null && session.getControlConnection() == conn) {
-            session.setControlConnection(null);
+        if (session != null) {
+            session.close();
         }
         sessionManager.checkAndCleanupSession(clientId);
     }
@@ -58,8 +58,7 @@ public final class ControlWebSocket extends WebSocketServer {
             String clientId = WsUtils.extractClientId(conn);
             ClientSession session = sessionManager.getSession(clientId);
             if (session != null) {
-                session.getTrafficEngine().onCongestion();
-                session.broadcastTelemetry();
+                session.handleSessionError("Control WebSocket error", ex);
             }
         }
     }
@@ -69,25 +68,28 @@ public final class ControlWebSocket extends WebSocketServer {
         virtualExecutor.submit(() -> processControlMessageOrchestration(conn, message));
     }
 
-    /**
-     * Orchestrator: Dispatches parsed control action to target session.
-     */
     private void processControlMessageOrchestration(WebSocket conn, String json) {
         String clientId = WsUtils.extractClientId(conn);
         ClientSession session = sessionManager.getOrCreateSession(clientId);
         String type = extractStringField(json, "type");
-
         switch (type) {
+            case "HELLO" -> handleHello(session, json);
             case "SYNC_VIEW" -> handleSyncView(session, json);
+            case "BATCH_ACCEPT" -> handleBatchAccept(session, json);
+            case "BATCH_DEFER" -> handleBatchDefer(session, json);
             case "ACK_BATCH" -> handleAckBatch(session, json);
             case "ABORT" -> handleAbort(session, json);
             case "EVICT" -> handleEvict(session, json);
-            case "GET_IMAGE_INFO" -> session.sendImageInfo();
-            default -> { /* Ignore unrecognized messages */ }
+            case "GET_IMAGE_INFO" -> session.sendSessionReady();
+            default -> {}
         }
     }
 
-    // --- Sub-functions (Single-responsibility) ---
+    private void handleHello(ClientSession session, String json) {
+        String ver = extractStringField(json, "clientVersion");
+        long maxMem = extractLongField(json, "maxMemoryBytes", 128 * 1024 * 1024L);
+        session.handleHello(ver, maxMem);
+    }
 
     private void handleSyncView(ClientSession session, String json) {
         int epoch = extractIntField(json, "epoch", 0);
@@ -101,14 +103,37 @@ public final class ControlWebSocket extends WebSocketServer {
 
         session.setCurrentEpoch(epoch);
         session.getDispatcher().enqueueViewport(epoch, zoom, minX, minY, maxX, maxY, centerX, centerY);
+        session.ensureBootstrapRootTask(epoch);
         session.triggerDispatch();
         session.broadcastTelemetry();
     }
 
+    private void handleBatchAccept(ClientSession session, String json) {
+        String genId = extractStringField(json, "generationId");
+        int batchId = extractIntField(json, "batchId", -1);
+        int grantId = extractIntField(json, "grantId", 0);
+        List<String> acceptedKeys = extractStringList(json, "acceptedKeys");
+        session.handleBatchAccept(genId, batchId, grantId, acceptedKeys);
+    }
+
+    private void handleBatchDefer(ClientSession session, String json) {
+        String genId = extractStringField(json, "generationId");
+        int batchId = extractIntField(json, "batchId", -1);
+        String reason = extractStringField(json, "reason");
+        session.handleBatchDefer(genId, batchId, reason);
+    }
+
     private void handleAckBatch(ClientSession session, String json) {
-        session.getTrafficEngine().onAck();
-        session.broadcastTelemetry();
-        session.triggerDispatch();
+        String genId = extractStringField(json, "generationId");
+        int batchId = extractIntField(json, "batchId", -1);
+        int epoch = extractIntField(json, "epoch", -1);
+        int grantId = extractIntField(json, "grantId", 0);
+        int sentCount = extractIntField(json, "sentCount", -1);
+        int omittedCount = extractIntField(json, "omittedCount", 0);
+        Map<String, String> terminalResults = extractStringMap(json, "terminalResults");
+        List<String> admittedKeys = extractStringList(json, "admittedKeys");
+        long residencySeq = extractLongField(json, "residencySeq", 0L);
+        session.handleAckBatch(genId, batchId, epoch, grantId, sentCount, omittedCount, terminalResults, admittedKeys, residencySeq);
     }
 
     private void handleAbort(ClientSession session, String json) {
@@ -119,7 +144,10 @@ public final class ControlWebSocket extends WebSocketServer {
     }
 
     private void handleEvict(ClientSession session, String json) {
-        // Notification of client-side cache eviction for telemetry
+        String genId = extractStringField(json, "generationId");
+        String key = extractStringField(json, "key");
+        long residencySeq = extractLongField(json, "residencySeq", 0L);
+        session.handleEvict(genId, key, residencySeq);
     }
 
     private static String extractStringField(String json, String field) {
@@ -132,5 +160,43 @@ public final class ControlWebSocket extends WebSocketServer {
         Pattern pattern = Pattern.compile("\"" + field + "\"\\s*:\\s*(-?\\d+)");
         Matcher matcher = pattern.matcher(json);
         return matcher.find() ? Integer.parseInt(matcher.group(1)) : fallback;
+    }
+
+    private static long extractLongField(String json, String field, long fallback) {
+        Pattern pattern = Pattern.compile("\"" + field + "\"\\s*:\\s*(-?\\d+)");
+        Matcher matcher = pattern.matcher(json);
+        return matcher.find() ? Long.parseLong(matcher.group(1)) : fallback;
+    }
+
+    private static List<String> extractStringList(String json, String field) {
+        List<String> list = new ArrayList<>();
+        int fieldIdx = json.indexOf("\"" + field + "\"");
+        if (fieldIdx < 0) return list;
+        int startBracket = json.indexOf('[', fieldIdx);
+        int endBracket = json.indexOf(']', startBracket);
+        if (startBracket >= 0 && endBracket > startBracket) {
+            String content = json.substring(startBracket + 1, endBracket);
+            Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(content);
+            while (m.find()) {
+                list.add(m.group(1));
+            }
+        }
+        return list;
+    }
+
+    private static Map<String, String> extractStringMap(String json, String field) {
+        Map<String, String> map = new HashMap<>();
+        int fieldIdx = json.indexOf("\"" + field + "\"");
+        if (fieldIdx < 0) return map;
+        int startBracket = json.indexOf('{', fieldIdx);
+        int endBracket = json.indexOf('}', startBracket);
+        if (startBracket >= 0 && endBracket > startBracket) {
+            String content = json.substring(startBracket + 1, endBracket);
+            Matcher m = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"]+)\"").matcher(content);
+            while (m.find()) {
+                map.put(m.group(1), m.group(2));
+            }
+        }
+        return map;
     }
 }

@@ -17,6 +17,7 @@ export class TelemetryHud {
             diff: document.getElementById('stat-diff'),
             pending: document.getElementById('stat-pending'),
             cacheCount: document.getElementById('stat-cache-count'),
+            cacheMax: document.getElementById('stat-cache-max'),
             cacheBar: document.getElementById('bar-cache'),
             evictions: document.getElementById('stat-evictions'),
             zoom: document.getElementById('stat-zoom'),
@@ -132,11 +133,22 @@ export class TelemetryHud {
         if (!this.dom.cacheCount) return;
 
         const stats = cache.getStats();
-        this.dom.cacheCount.textContent = `${stats.size} / ${stats.maxSize}`;
-        this.dom.evictions.textContent = stats.evictions;
+        const totMb = (stats.totalBytes / (1024 * 1024)).toFixed(1);
+        const resMb = (stats.currentBytes / (1024 * 1024)).toFixed(1);
+        const maxMb = (stats.maxBytes / (1024 * 1024)).toFixed(0);
+        this.dom.cacheCount.textContent = `${totMb} MB (${stats.size} t | R:${resMb})`;
+        if (this.dom.cacheMax) {
+            this.dom.cacheMax.textContent = `/ ${maxMb} MB`;
+        }
+        const jKb = Math.round(stats.pendingJpegBytes / 1024);
+        const dKb = Math.round(stats.pendingDecodeBytes / 1024);
+        const gKb = Math.round((stats.grantedBytes || 0) / 1024);
+        this.dom.evictions.textContent = `${stats.evictions} ev | J:${jKb}k D:${dKb}k G:${gKb}k`;
 
-        const percentage = Math.min(100, Math.round((stats.size / stats.maxSize) * 100));
-        this.dom.cacheBar.style.width = `${percentage}%`;
+        const percentage = Math.min(100, Math.round((stats.totalBytes / stats.maxBytes) * 100));
+        if (this.dom.cacheBar) {
+            this.dom.cacheBar.style.width = `${Math.max(2, percentage)}%`;
+        }
     }
 
     updateCameraMetrics(viewport, epoch, visibleTilesCount) {

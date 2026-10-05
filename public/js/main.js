@@ -3,6 +3,9 @@ import { Viewport } from './viewport.js';
 import { ProtocolClient } from './protocol.js';
 import { CanvasRenderer } from './renderer.js';
 import { TelemetryHud } from './hud.js';
+import { CLIENT_CONFIG } from './config.js';
+
+export { CLIENT_CONFIG };
 
 /**
  * Main Application Orchestrator.
@@ -10,9 +13,10 @@ import { TelemetryHud } from './hud.js';
  * dynamic cache protection, and protocol communication.
  */
 class Application {
-    constructor() {
+    constructor(config = CLIENT_CONFIG) {
+        this.config = config;
         this.canvas = document.getElementById('viewport-canvas');
-        this.cache = new TileCache(120);
+        this.cache = new TileCache(this.config.maxCacheBytes, this.config.maxCacheEntries);
         this.viewport = new Viewport(this.canvas, 256, 8);
         this.renderer = new CanvasRenderer(this.canvas, this.cache);
         this.hud = new TelemetryHud();
@@ -24,8 +28,10 @@ class Application {
 
         this.protocol = new ProtocolClient(this.cache, {
             onConnectionChange: (channel, online) => this.handleConnectionChange(channel, online),
+            onDataReady: () => this.handleDataReady(),
             onTelemetry: (msg) => this.handleIncomingTelemetry(msg),
-            onTileArrived: (key) => this.handleTileArrived(key)
+            onTileArrived: (key) => this.handleTileArrived(key),
+            isKeyRelevant: (key) => this.isKeyRelevant(key)
         });
     }
 
@@ -86,49 +92,77 @@ class Application {
      */
     handleConnectionChange(channel, online) {
         this.hud.setConnectionStatus(channel, online);
-        this.checkAndRequestImmortalBaseTile();
     }
 
-    checkAndRequestImmortalBaseTile() {
-        if (!this.cache.has('0:0:0') && this.protocol.isReady()) {
+    handleDataReady() {
+        this.baseTileRequested = false;
+        if (!this.cache.has('0:0:0')) {
             this.requestImmortalBaseTile();
         }
+        this.dispatchSyncViewOrchestrator();
     }
 
     requestImmortalBaseTile() {
-        this.baseTileRequested = true;
         this.cache.markImmortal('0:0:0');
-        // Low-priority sync for z=0 base layer root tile
-        this.protocol.sendSyncView({
-            zoom: 0, minX: 0, minY: 0, maxX: 0, maxY: 0, centerX: 0, centerY: 0
-        }, this.lastEpoch);
+        if (!this.protocol.isReady()) return;
+        this.baseTileRequested = true;
     }
 
     handleTileArrived(key) {
+        this.cache.recordDemand(key);
         if (key === '0:0:0') {
             this.cache.markImmortal('0:0:0');
-            const baseBitmap = this.cache.get('0:0:0');
-            if (baseBitmap) {
-                this.renderer.setBaseThumbnail(baseBitmap);
-            }
+            this.baseTileRequested = true;
         }
     }
 
+    isKeyRelevant(key) {
+        if (key === '0:0:0') return true;
+        if (!this.viewport || !this.renderer?.geometry) return true;
+        const [zStr, xStr, yStr] = key.split(':');
+        const z = parseInt(zStr, 10), x = parseInt(xStr, 10), y = parseInt(yStr, 10);
+        const geom = this.renderer.geometry;
+        if (!geom.isValidTile(z, x, y)) return false;
+        const cb = this.viewport.computeVisibleBounds();
+        if (Math.abs(z - cb.zoom) > 2) return false;
+        const minExt = geom.tileOriginalExtent(cb.zoom, cb.minX, cb.minY);
+        const maxExt = geom.tileOriginalExtent(cb.zoom, cb.maxX, cb.maxY);
+        const tExt = geom.tileOriginalExtent(z, x, y);
+        return !(tExt.x1 < minExt.x0 || tExt.x0 > maxExt.x1 || tExt.y1 < minExt.y0 || tExt.y0 > maxExt.y1);
+    }
+
     handleIncomingTelemetry(msg) {
-        if (msg.type === 'IMAGE_INFO') {
-            this.viewport.setImageDimensions(msg);
-            const titleEl = document.getElementById('image-title');
-            if (titleEl && msg.originalWidth && msg.originalHeight) {
-                titleEl.textContent = `Panorámica Ultra-HD 40K (${msg.originalWidth.toLocaleString()} × ${msg.originalHeight.toLocaleString()} px)`;
-            }
-            this.viewport.resetToCover();
-            this.scheduleSyncView();
+        if (msg.type === 'IMAGE_INFO' || msg.type === 'SESSION_READY') {
+            this.handleSessionReady(msg);
         } else if (msg.type === 'CWND_UPDATE') {
-            if (msg.maxZoom !== undefined && msg.maxZoom > 0) {
-                this.viewport.maxZoom = msg.maxZoom;
-            }
-            this.hud.updateCwndMetrics(this.protocol);
+            this.handleCwndUpdate(msg);
         }
+    }
+
+    handleSessionReady(msg) {
+        this.baseTileRequested = false;
+        this.viewport.setImageDimensions(msg);
+        this.renderer.updateGeometry(msg.originalWidth, msg.originalHeight, msg.tileSize, msg.maxZoom);
+        this.updateImageTitle(msg);
+        this.viewport.resetToCover();
+        if (this.protocol.isReady()) {
+            this.requestImmortalBaseTile();
+            this.scheduleSyncView();
+        }
+    }
+
+    updateImageTitle(msg) {
+        const titleEl = document.getElementById('image-title');
+        if (titleEl && msg.originalWidth && msg.originalHeight) {
+            titleEl.textContent = `Panorámica Ultra-HD (${msg.originalWidth.toLocaleString()} × ${msg.originalHeight.toLocaleString()} px)`;
+        }
+    }
+
+    handleCwndUpdate(msg) {
+        if (msg.maxZoom !== undefined && msg.maxZoom > 0) {
+            this.viewport.maxZoom = msg.maxZoom;
+        }
+        this.hud.updateCwndMetrics(this.protocol);
     }
 
     scheduleSyncView() {
@@ -154,13 +188,22 @@ class Application {
 
     dispatchSyncViewOrchestrator() {
         const bounds = this.viewport.computeVisibleBounds();
-        const currentZoom = bounds.zoom;
+        const boundsChanged = !this.lastRequestedBounds ||
+            this.lastRequestedBounds.zoom !== bounds.zoom ||
+            this.lastRequestedBounds.minX !== bounds.minX ||
+            this.lastRequestedBounds.maxX !== bounds.maxX ||
+            this.lastRequestedBounds.minY !== bounds.minY ||
+            this.lastRequestedBounds.maxY !== bounds.maxY;
 
-        const zoomChanged = (this.lastZoom !== undefined && this.lastZoom !== currentZoom);
-        if (zoomChanged) {
-            this.cache.lockLevel(this.lastZoom);
-            this.lastZoom = currentZoom;
+        if (boundsChanged) {
             this.lastEpoch++;
+            this.lastRequestedBounds = {
+                zoom: bounds.zoom,
+                minX: bounds.minX,
+                maxX: bounds.maxX,
+                minY: bounds.minY,
+                maxY: bounds.maxY
+            };
         }
 
         this.protocol.sendSyncView(bounds, this.lastEpoch);
@@ -213,11 +256,9 @@ class Application {
 
     runRenderLoop() {
         const frameStep = () => {
-            this.checkAndRequestImmortalBaseTile();
             this.viewport.update();
             const { renderedCount, visibleKeys } = this.renderer.renderFrame(this.viewport);
             this.cache.updateVisibleKeys(visibleKeys);
-            this.cache.adjustCapacity(visibleKeys.size);
             this.hud.updateFrame(this.viewport, this.cache, this.protocol, renderedCount);
             requestAnimationFrame(frameStep);
         };
@@ -227,6 +268,8 @@ class Application {
 
 // Bootstrap on DOM ready
 window.addEventListener('DOMContentLoaded', () => {
-    const app = new Application();
-    app.start();
+    if (document.getElementById('viewport-canvas')) {
+        const app = new Application();
+        app.start();
+    }
 });

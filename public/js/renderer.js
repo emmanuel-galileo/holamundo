@@ -1,7 +1,9 @@
+import { PyramidGeometry } from './geometry.js';
+
 /**
  * Canvas 2D High-Performance Multi-Resolution Rendering Pipeline.
- * Implements the Canonical Unified Rendering Algorithm with Hierarchical Ancestor Fallback
- * (OpenSeadragon / Leaflet standard) to eliminate staircasing and black void artifacts.
+ * Implements exact rectangular geometry, sub-pixel alignment, non-stretching partial tile rendering,
+ * and mathematical ancestor quadrant cropping without pixel brightness heuristics.
  */
 export class CanvasRenderer {
     /**
@@ -14,9 +16,9 @@ export class CanvasRenderer {
         this.ctx = canvas.getContext('2d', { alpha: false });
         this.cache = cache;
         this.tileSize = tileSize;
-        this.showGrid = false; // Grid OFF by default for cinematic presentation
+        this.showGrid = false;
         this.lastStableLevel = 0;
-        this.baseThumbnail = null;
+        this.geometry = new PyramidGeometry(40192, 30208, tileSize, 8);
         this.configureContext();
     }
 
@@ -25,52 +27,31 @@ export class CanvasRenderer {
         this.ctx.imageSmoothingQuality = 'high';
     }
 
-    setBaseThumbnail(bitmap) {
-        this.baseThumbnail = bitmap;
-        this.detectBaseContentBounds(bitmap);
+    updateGeometry(originalWidth, originalHeight, tileSize, maxZoom) {
+        this.geometry = new PyramidGeometry(originalWidth, originalHeight, tileSize, maxZoom);
     }
 
-    detectBaseContentBounds(bitmap) {
-        try {
-            const offscreen = document.createElement('canvas');
-            offscreen.width = bitmap.width;
-            offscreen.height = bitmap.height;
-            const octx = offscreen.getContext('2d', { willReadFrequently: true });
-            octx.drawImage(bitmap, 0, 0);
-            const imgData = octx.getImageData(0, 0, bitmap.width, bitmap.height).data;
-
-            let maxCol = 0;
-            let maxRow = 0;
-            for (let y = 0; y < bitmap.height; y++) {
-                for (let x = 0; x < bitmap.width; x++) {
-                    const idx = (y * bitmap.width + x) * 4;
-                    if (imgData[idx] > 5 || imgData[idx + 1] > 5 || imgData[idx + 2] > 5) {
-                        if (x > maxCol) maxCol = x;
-                        if (y > maxRow) maxRow = y;
-                    }
-                }
-            }
-            this.baseContentWidth = maxCol > 0 ? (maxCol + 1) : bitmap.width;
-            this.baseContentHeight = maxRow > 0 ? (maxRow + 1) : bitmap.height;
-        } catch (e) {
-            this.baseContentWidth = bitmap.width;
-            this.baseContentHeight = bitmap.height;
-        }
+    toggleGrid() {
+        this.showGrid = !this.showGrid;
+        return this.showGrid;
     }
 
     /**
      * Orchestrator: Renders the entire frame in a single deterministic pass.
-     * Guarantees zero black voids by drawing the full-world base thumbnail first,
-     * followed by high-resolution tile layers.
      * @param {Viewport} viewport
      * @returns {{ renderedCount: number, directHits: number, visibleKeys: Set<string> }}
      */
     renderFrame(viewport) {
-        this.clearBackground();
-        this.drawImmortalBaseCanvas(viewport);
-        const bounds = viewport.computeVisibleBounds();
-        const result = this.renderVisibleGrid(viewport, bounds);
-        return result;
+        try {
+            this.clearBackground();
+            this.drawImmortalBaseCanvas(viewport);
+            const bounds = viewport.computeVisibleBounds();
+            return this.renderVisibleGrid(viewport, bounds);
+        } finally {
+            if (typeof this.cache.releaseFrameBorrows === 'function') {
+                this.cache.releaseFrameBorrows();
+            }
+        }
     }
 
     // --- Sub-functions (Single-responsibility) ---
@@ -81,27 +62,22 @@ export class CanvasRenderer {
     }
 
     drawImmortalBaseCanvas(viewport) {
-        const base = this.baseThumbnail || this.cache.get('0:0:0');
+        const base = typeof this.cache.borrow === 'function' ? this.cache.borrow('0:0:0') : this.cache.peek('0:0:0');
         if (!base) return;
 
         const worldW = viewport.getScaledWorldWidth();
         const worldH = viewport.getScaledWorldHeight();
         const screenX = -viewport.camX;
         const screenY = -viewport.camY;
-
-        const srcW = this.baseContentWidth || base.width;
-        const srcH = this.baseContentHeight || base.height;
+        const rootDim = this.geometry.rootContentDimensions();
 
         this.ctx.drawImage(
             base,
-            0, 0, srcW, srcH,
+            0, 0, rootDim.srcW, rootDim.srcH,
             screenX, screenY, worldW, worldH
         );
     }
 
-    /**
-     * Orchestrator: Iterates strictly over the visible bounding box of the target zoom level.
-     */
     renderVisibleGrid(viewport, bounds) {
         let count = 0;
         let directHits = 0;
@@ -111,12 +87,10 @@ export class CanvasRenderer {
 
         for (let y = bounds.minY; y <= bounds.maxY; y++) {
             for (let x = bounds.minX; x <= bounds.maxX; x++) {
-                const rect = this.computeTileScreenRect(x, y, bounds, viewport);
+                const rect = this.computeTileScreenRect(x, y, zoom, viewport);
                 if (this.isTileOnScreen(rect)) {
                     const isDirect = this.renderTileCell(zoom, x, y, rect, visibleKeys, viewport);
-                    if (isDirect) {
-                        directHits++;
-                    }
+                    if (isDirect) directHits++;
                     count++;
                 }
             }
@@ -135,10 +109,6 @@ export class CanvasRenderer {
         return isDirect;
     }
 
-    /**
-     * Orchestrator: Draws exact tile, or traverses pyramid downwards (z-1 down to 0)
-     * until the sharpest available ancestor quadrant is found and rendered.
-     */
     drawTileWithHierarchicalFallback(zoom, x, y, rect, visibleKeys) {
         if (this.drawDirectTile(zoom, x, y, rect)) {
             return true;
@@ -149,9 +119,12 @@ export class CanvasRenderer {
 
     drawDirectTile(zoom, x, y, rect) {
         const key = `${zoom}:${x}:${y}`;
-        const bitmap = this.cache.get(key);
+        const bitmap = typeof this.cache.borrow === 'function' ? this.cache.borrow(key) : this.cache.peek(key);
         if (bitmap) {
-            this.ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, rect.dx, rect.dy, rect.dw, rect.dh);
+            if (bitmap.width < Math.ceil(rect.srcW) || bitmap.height < Math.ceil(rect.srcH)) {
+                return false;
+            }
+            this.ctx.drawImage(bitmap, 0, 0, rect.srcW, rect.srcH, rect.dx, rect.dy, rect.dw, rect.dh);
             return true;
         }
         return false;
@@ -160,7 +133,7 @@ export class CanvasRenderer {
     drawBestAncestor(zoom, x, y, rect, visibleKeys) {
         for (let za = zoom - 1; za >= 0; za--) {
             const dz = zoom - za;
-            const divisor = 1 << dz; // 2^(zoom - za)
+            const divisor = 1 << dz;
             const xa = Math.floor(x / divisor);
             const ya = Math.floor(y / divisor);
             const ancestorKey = `${za}:${xa}:${ya}`;
@@ -168,8 +141,7 @@ export class CanvasRenderer {
             const bitmap = this.getAncestorBitmap(za, ancestorKey);
             if (bitmap) {
                 visibleKeys.add(ancestorKey);
-                const isBase = (za === 0);
-                this.drawAncestorSubRect(bitmap, x, y, divisor, rect, isBase);
+                this.drawAncestorSubRect(bitmap, zoom, x, y, za, xa, ya, rect);
                 return true;
             }
         }
@@ -177,94 +149,80 @@ export class CanvasRenderer {
     }
 
     getAncestorBitmap(za, key) {
-        if (za === 0) {
-            return this.baseThumbnail || this.cache.get('0:0:0');
-        }
-        return this.cache.get(key);
+        return typeof this.cache.borrow === 'function' ? this.cache.borrow(key) : this.cache.peek(key);
     }
 
-    /**
-     * Mathematical quadrant cropping inside ancestor texture:
-     * dx_rel = x % divisor, dy_rel = y % divisor
-     * sw = Tw / divisor, sh = Th / divisor
-     * sx = dx_rel * sw, sy = dy_rel * sh
-     */
-    drawAncestorSubRect(bitmap, x, y, divisor, rect, isBase = false) {
-        const fullW = (isBase && this.baseContentWidth) ? this.baseContentWidth : bitmap.width;
-        const fullH = (isBase && this.baseContentHeight) ? this.baseContentHeight : bitmap.height;
-        const sw = fullW / divisor;
-        const sh = fullH / divisor;
-        const sx = (x % divisor) * sw;
-        const sy = (y % divisor) * sh;
+    drawAncestorSubRect(bitmap, targetZ, x, y, ancestorZ, xa, ya, rect) {
+        const crop = this.geometry.computeAncestorCrop(targetZ, x, y, ancestorZ, xa, ya, bitmap);
+        if (crop.sw <= 0 || crop.sh <= 0) return;
 
         this.ctx.drawImage(
             bitmap,
-            sx, sy, sw, sh,
+            crop.sx, crop.sy, crop.sw, crop.sh,
             rect.dx, rect.dy, rect.dw, rect.dh
         );
     }
 
-    computeTileScreenRect(x, y, bounds, viewport) {
-        const levelTileSize = bounds.levelTileSize;
-        const rawX = x * levelTileSize - viewport.camX;
-        const rawY = y * levelTileSize - viewport.camY;
+    /**
+     * Computes the exact destination on screen for tile (x, y) without stretching partial tiles.
+     */
+    computeTileScreenRect(x, y, zoom, viewport) {
+        const s = viewport.currentScale;
+        const content = this.geometry.tileContentDimensions(zoom, x, y);
+        const extent = content.extent;
 
-        // Sub-pixel snapping without artificial +1 bleed
-        const dx = Math.floor(rawX);
-        const dy = Math.floor(rawY);
-        const dw = Math.ceil(rawX + levelTileSize) - dx;
-        const dh = Math.ceil(rawY + levelTileSize) - dy;
+        const rawX0 = s * extent.x0 - viewport.camX;
+        const rawX1 = s * extent.x1 - viewport.camX;
+        const rawY0 = s * extent.y0 - viewport.camY;
+        const rawY1 = s * extent.y1 - viewport.camY;
 
-        return { dx, dy, dw, dh, sx: dx, sy: dy, sw: dw, sh: dh };
+        const dx = Math.round(rawX0);
+        const dy = Math.round(rawY0);
+        const dw = Math.round(rawX1) - dx;
+        const dh = Math.round(rawY1) - dy;
+
+        const srcW = content.srcW;
+        const srcH = content.srcH;
+
+        return { dx, dy, dw, dh, srcW, srcH, sx: dx, sy: dy, sw: dw, sh: dh };
     }
 
     isTileOnScreen(rect) {
-        return rect.dx + rect.dw > 0 && rect.dx < this.canvas.width &&
-               rect.dy + rect.dh > 0 && rect.dy < this.canvas.height;
+        return (
+            rect.dx + rect.dw > 0 &&
+            rect.dx < this.canvas.width &&
+            rect.dy + rect.dh > 0 &&
+            rect.dy < this.canvas.height
+        );
     }
 
-    checkAndUpdateStableLevel(zoom, bounds, directHits, totalTiles) {
-        const hasCenterQuad = this.hasConfirmedCentralTiles(zoom, bounds);
-        const hasHighCoverage = totalTiles > 0 && (directHits / totalTiles) >= 0.75;
+    checkAndUpdateStableLevel(zoom, bounds, directHits, totalCount) {
+        if (totalCount === 0) return;
 
-        if (hasCenterQuad || hasHighCoverage) {
+        const hasCentralFovea = this.hasCentralTiles(zoom, bounds.centerX, bounds.centerY);
+        const coverageRatio = directHits / totalCount;
+
+        if (hasCentralFovea || coverageRatio >= 0.75) {
             this.lastStableLevel = zoom;
-            this.cache.lockLevel(zoom);
+            this.cache.unlockLevel();
         }
     }
 
-    hasConfirmedCentralTiles(zoom, bounds) {
-        const cx = bounds.centerX;
-        const cy = bounds.centerY;
-        const quadKeys = [
-            `${zoom}:${cx}:${cy}`,
-            `${zoom}:${Math.min(bounds.maxX, cx + 1)}:${cy}`,
-            `${zoom}:${cx}:${Math.min(bounds.maxY, cy + 1)}`,
-            `${zoom}:${Math.min(bounds.maxX, cx + 1)}:${Math.min(bounds.maxY, cy + 1)}`
-        ];
-        const uniqueKeys = [...new Set(quadKeys)];
-        return uniqueKeys.every((k) => this.cache.has(k));
+    hasCentralTiles(zoom, cx, cy) {
+        return (
+            this.cache.has(`${zoom}:${cx}:${cy}`) &&
+            this.cache.has(`${zoom}:${cx + 1}:${cy}`) &&
+            this.cache.has(`${zoom}:${cx}:${cy + 1}`)
+        );
     }
 
     drawTileGridLines(zoom, x, y, rect, viewport) {
-        const maxTileX = viewport.getMaxTileIndexX(zoom);
-        const maxTileY = viewport.getMaxTileIndexY(zoom);
-
-        if (x < 0 || x > maxTileX || y < 0 || y > maxTileY) {
-            return; // Outside real image bounds — no ghost grid lines
-        }
-
-        this.ctx.strokeStyle = 'rgba(0, 229, 255, 0.2)';
+        this.ctx.strokeStyle = 'rgba(77, 171, 247, 0.4)';
         this.ctx.lineWidth = 1;
         this.ctx.strokeRect(rect.dx, rect.dy, rect.dw, rect.dh);
 
-        this.ctx.fillStyle = 'rgba(0, 229, 255, 0.75)';
-        this.ctx.font = '10px ui-monospace, monospace';
-        this.ctx.fillText(`z${zoom}:${x},${y}`, rect.dx + 4, rect.dy + 12);
-    }
-
-    toggleGrid() {
-        this.showGrid = !this.showGrid;
-        return this.showGrid;
+        this.ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+        this.ctx.font = '10px monospace';
+        this.ctx.fillText(`${zoom}:${x},${y}`, rect.dx + 4, rect.dy + 14);
     }
 }

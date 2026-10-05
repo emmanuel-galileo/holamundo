@@ -1,10 +1,13 @@
 package com.uhip.dispatch;
 
+import com.uhip.pyramid.PyramidGeometry;
+
 import java.util.*;
 
 /**
  * Priority queue dispatcher for viewport tiles ordered by Manhattan distance
  * from the viewport center to ensure central tiles are transmitted first.
+ * Supports exact rectangular image boundaries and view demand substitution.
  */
 public final class TileDispatcher {
 
@@ -12,24 +15,61 @@ public final class TileDispatcher {
 
     private final PriorityQueue<TileTask> queue;
     private final Set<String> enqueuedKeys;
+    private volatile PyramidGeometry geometry;
+    private volatile java.util.function.Predicate<String> exclusionFilter;
     private int currentEpoch;
 
     public TileDispatcher() {
+        this(null);
+    }
+
+    public TileDispatcher(PyramidGeometry geometry) {
         this.queue = new PriorityQueue<>(Comparator.comparingInt(TileTask::priority));
         this.enqueuedKeys = new HashSet<>();
+        this.geometry = geometry;
         this.currentEpoch = 0;
+    }
+
+    public void setExclusionFilter(java.util.function.Predicate<String> filter) {
+        this.exclusionFilter = filter;
+    }
+
+    public void setGeometry(PyramidGeometry geometry) {
+        this.geometry = geometry;
+    }
+
+    public PyramidGeometry getGeometry() {
+        return geometry;
     }
 
     /**
      * Orchestrator: Enqueues an entire viewport bounding box ordered by Manhattan distance.
+     * Replaces obsolete demand within the same epoch and purges stale epochs.
      */
     public synchronized void enqueueViewport(int epoch, int zoom, int minX, int minY, int maxX, int maxY, int centerX, int centerY) {
         if (isObsoleteEpoch(epoch)) {
             return;
         }
-        clearStaleQueueIfEpochAdvanced(epoch);
-        syncEpoch(epoch);
-        fillBoundingBox(epoch, zoom, minX, minY, maxX, maxY, centerX, centerY);
+        PyramidGeometry.ClampedBounds bounds = computeClampedBounds(zoom, minX, minY, maxX, maxY);
+        if (epoch > this.currentEpoch) {
+            clearStaleQueueIfEpochAdvanced(epoch);
+            syncEpoch(epoch);
+        } else {
+            reconcileExistingViewportTasks(zoom, bounds, centerX, centerY);
+        }
+        fillBoundingBox(epoch, zoom, bounds, centerX, centerY);
+    }
+
+    public synchronized void reenqueueTasks(List<TileTask> tasks) {
+        if (tasks == null || tasks.isEmpty()) return;
+        for (TileTask task : tasks) {
+            if (task.epoch() >= this.currentEpoch) {
+                String key = task.zoom() + ":" + task.tileX() + ":" + task.tileY();
+                if (!isKeyExcluded(key) && enqueuedKeys.add(key)) {
+                    queue.offer(task);
+                }
+            }
+        }
     }
 
     /**
@@ -49,16 +89,10 @@ public final class TileDispatcher {
         purgeTasksMatchingEpoch(targetEpoch);
     }
 
-    /**
-     * Returns total pending tiles in queue.
-     */
     public synchronized int getPendingCount() {
         return queue.size();
     }
 
-    /**
-     * Returns current active epoch id.
-     */
     public synchronized int getCurrentEpoch() {
         return currentEpoch;
     }
@@ -76,32 +110,70 @@ public final class TileDispatcher {
     }
 
     private void clearStaleQueueIfEpochAdvanced(int newEpoch) {
-        if (newEpoch > this.currentEpoch) {
-            queue.clear();
-            enqueuedKeys.clear();
+        queue.clear();
+        enqueuedKeys.clear();
+    }
+
+    private PyramidGeometry.ClampedBounds computeClampedBounds(int zoom, int minX, int minY, int maxX, int maxY) {
+        if (geometry != null) {
+            return geometry.clampBounds(zoom, minX, minY, maxX, maxY);
+        }
+        int maxIndex = Math.max(0, (1 << zoom) - 1);
+        int cMinX = Math.max(0, Math.min(maxIndex, minX));
+        int cMaxX = Math.max(0, Math.min(maxIndex, maxX));
+        int cMinY = Math.max(0, Math.min(maxIndex, minY));
+        int cMaxY = Math.max(0, Math.min(maxIndex, maxY));
+        return new PyramidGeometry.ClampedBounds(cMinX, cMinY, cMaxX, cMaxY, (cMinX + cMaxX) / 2, (cMinY + cMaxY) / 2);
+    }
+
+    private void reconcileExistingViewportTasks(int zoom, PyramidGeometry.ClampedBounds b, int cx, int cy) {
+        List<TileTask> kept = new ArrayList<>();
+        enqueuedKeys.clear();
+        while (!queue.isEmpty()) {
+            TileTask task = queue.poll();
+            if (isTaskInsideBounds(task, zoom, b)) {
+                int newPriority = calculateManhattanDistance(task.tileX(), task.tileY(), cx, cy);
+                kept.add(new TileTask(task.epoch(), task.zoom(), task.tileX(), task.tileY(), newPriority));
+                enqueuedKeys.add(task.zoom() + ":" + task.tileX() + ":" + task.tileY());
+            }
+        }
+        queue.addAll(kept);
+    }
+
+    private boolean isTaskInsideBounds(TileTask t, int zoom, PyramidGeometry.ClampedBounds b) {
+        if (t.zoom() == 0 && t.tileX() == 0 && t.tileY() == 0) {
+            return !isKeyExcluded("0:0:0");
+        }
+        return t.zoom() == zoom && t.tileX() >= b.minX() && t.tileX() <= b.maxX() && t.tileY() >= b.minY() && t.tileY() <= b.maxY();
+    }
+
+    public synchronized void enqueueRootTask(int epoch) {
+        if (geometry != null && geometry.getMaxZoom() >= 0 && !isKeyExcluded("0:0:0")) {
+            if (enqueuedKeys.add("0:0:0")) {
+                queue.offer(new TileTask(epoch, 0, 0, 0, 0));
+            }
         }
     }
 
-    private void fillBoundingBox(int epoch, int zoom, int minX, int minY, int maxX, int maxY, int centerX, int centerY) {
-        int maxIndex = (1 << zoom) - 1;
-        int clampedMinX = Math.max(0, minX);
-        int clampedMaxX = Math.min(maxIndex, maxX);
-        int clampedMinY = Math.max(0, minY);
-        int clampedMaxY = Math.min(maxIndex, maxY);
-
-        for (int y = clampedMinY; y <= clampedMaxY; y++) {
-            for (int x = clampedMinX; x <= clampedMaxX; x++) {
-                offerTileIfNew(epoch, zoom, x, y, centerX, centerY);
+    private void fillBoundingBox(int epoch, int zoom, PyramidGeometry.ClampedBounds b, int cx, int cy) {
+        for (int y = b.minY(); y <= b.maxY(); y++) {
+            for (int x = b.minX(); x <= b.maxX(); x++) {
+                offerTileIfNew(epoch, zoom, x, y, cx, cy);
             }
         }
     }
 
     private void offerTileIfNew(int epoch, int zoom, int x, int y, int cx, int cy) {
         String key = zoom + ":" + x + ":" + y;
+        if (isKeyExcluded(key)) return;
         if (enqueuedKeys.add(key)) {
             int priority = calculateManhattanDistance(x, y, cx, cy);
             queue.offer(new TileTask(epoch, zoom, x, y, priority));
         }
+    }
+
+    private boolean isKeyExcluded(String key) {
+        return exclusionFilter != null && exclusionFilter.test(key);
     }
 
     private int calculateManhattanDistance(int x, int y, int cx, int cy) {
@@ -109,10 +181,12 @@ public final class TileDispatcher {
     }
 
     private void drainTasksIntoBatch(List<TileTask> batch, int count) {
-        for (int i = 0; i < count; i++) {
+        while (batch.size() < count && !queue.isEmpty()) {
             TileTask task = queue.poll();
-            if (task != null) {
-                enqueuedKeys.remove(task.zoom() + ":" + task.tileX() + ":" + task.tileY());
+            if (task == null) break;
+            String key = task.zoom() + ":" + task.tileX() + ":" + task.tileY();
+            enqueuedKeys.remove(key);
+            if (!isKeyExcluded(key)) {
                 batch.add(task);
             }
         }

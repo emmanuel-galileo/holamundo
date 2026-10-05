@@ -242,6 +242,30 @@ Inmediatamente después del byte `0x0B` de la cabecera común, se transmite la c
 | `+0x04 - +0x05` | `Tile Y` | `uint16` | `0` a `65,535` (Big-Endian) | Índice vertical de la tesela en la cuadrícula de nivel $z$. |
 | `+0x06 - +(6+N)` | `JPEG Stream` | `byte[N]` | Secuencia binaria cruda | Flujo binario con cabeceras `0xFFD8` (SOI) y pie `0xFFD9` (EOI). |
 
+### 4.4 Trama Binaria de Inicio de Lote `BATCH_BEGIN` (`0x13`)
+
+Enviada por el canal de datos inmediatamente antes de iniciar el envío de las teselas físicas del lote. Establece el manifiesto binario estricto del lote:
+- **Cabecera Común (12 bytes):** `Magic=0x55`, `Version=0x01`, `OpCode=0x13`, `Flags=0x02`, `Epoch ID`, `PayloadLength = 16 + (10 * plannedCount)`.
+- **Carga Útil:**
+  - `[0-3]` `BatchId` (`uint32` Big-Endian): Identificador monotónico del lote.
+  - `[4-7]` `GrantId` (`uint32` Big-Endian): Identificador de concesión de congestión.
+  - `[8-9]` `PlannedCount` (`uint16` Big-Endian): Número exacto de teselas planificadas en el lote.
+  - `[10-11]` `Reserved` (`uint16`): `0x0000`.
+  - `[12-15]` `TotalJpegBytes` (`uint32` Big-Endian): Suma total de bytes JPEG comprimidos proyectados.
+  - Repetido por cada tesela planificada (10 bytes $\times$ `PlannedCount`):
+    - `[0]` `Zoom` (`uint8`), `[1]` `Reserved` (`uint8`), `[2-3]` `TileX` (`uint16`), `[4-5]` `TileY` (`uint16`), `[6-9]` `JpegLength` (`uint32`).
+
+### 4.5 Trama Binaria de Fin de Lote `BATCH_END` (`0x14`)
+
+Enviada por el canal de datos tras emitir la última tesela física del lote, sellando la ráfaga y reportando omisiones:
+- **Cabecera Común (12 bytes):** `Magic=0x55`, `Version=0x01`, `OpCode=0x14`, `Flags=0x02`, `Epoch ID`, `PayloadLength = 8 + (8 * omittedCount)`.
+- **Carga Útil:**
+  - `[0-3]` `BatchId` (`uint32` Big-Endian): Identificador del lote finalizado.
+  - `[4-5]` `SentCount` (`uint16` Big-Endian): Teselas físicas efectivamente enviadas.
+  - `[6-7]` `OmittedCount` (`uint16` Big-Endian): Teselas omitidas (por desfase de época o error de disco).
+  - Repetido por cada tesela omitida (8 bytes $\times$ `OmittedCount`):
+    - `[0]` `Zoom` (`uint8`), `[1]` `Reserved` (`uint8`), `[2-3]` `TileX` (`uint16`), `[4-5]` `TileY` (`uint16`), `[6]` `Reason` (`uint8`: `0x01` Stale, `0x02` IO Error), `[7]` `Reserved` (`uint8`).
+
 ---
 
 ## 5. Especificación Sintáctica del Canal de Control (JSON)
@@ -249,10 +273,11 @@ Inmediatamente después del byte `0x0B` de la cabecera común, se transmite la c
 Todos los mensajes del Canal de Control **MUST** serializarse en texto UTF-8 plano codificado como objetos JSON válidos con un campo obligatorio discriminador `"type"`.
 
 ### 5.1 Mensaje `IMAGE_INFO` (Servidor $\to$ Cliente)
-Emitido inmediatamente por el servidor al abrirse el socket de control para declarar los metadatos geométricos de la imagen:
+Emitido inmediatamente por el servidor al abrirse el socket de control para declarar los metadatos geométricos de la imagen y la generación de la sesión:
 ```json
 {
   "type": "IMAGE_INFO",
+  "generationId": 1,
   "originalWidth": 40192,
   "originalHeight": 30208,
   "tileSize": 256,
@@ -275,29 +300,66 @@ Emitido por el cliente cuando la cámara se desplaza o cambia de nivel de zoom p
   "centerY": 5
 }
 ```
+*Garantía de Respaldo Inmortal:* Al procesar `SYNC_VIEW`, el servidor verifica si la tesela raíz `0:0:0` ya se encuentra confirmada como residente en el cliente (`residentConfirmedKeys`). De no estarlo, inyecta `0:0:0` con prioridad Manhattan 0 en la cola del despachador, garantizando que el primer lote entregado proporcione el lienzo de respaldo universal para el renderizador y evite huecos oscuros (`#0a0d14`) durante desplazamientos o zoom acelerados.
 
 ### 5.3 Mensaje `BATCH_START` (Servidor $\to$ Cliente)
 Emitido por el servidor antes de liberar una ráfaga binaria para indicar cuántas teselas componen el lote:
 ```json
 {
   "type": "BATCH_START",
+  "generationId": 1,
+  "batchId": 42,
   "epoch": 14,
   "count": 32,
   "cwnd": 32
 }
 ```
 
-### 5.4 Mensaje `ACK_BATCH` (Cliente $\to$ Servidor)
-Emitido por el cliente tan pronto como se han recibido y procesado las teselas anunciadas en `BATCH_START`:
+### 5.4 Mensaje `ACK_BATCH` Estructurado (Cliente $\to$ Servidor)
+Emitido por el cliente exclusivamente cuando ha recibido la trama `BATCH_END` y ha finalizado la decodificación asíncrona de todas las teselas planificadas en el lote (`terminalResults.size == plannedCount`):
 ```json
 {
   "type": "ACK_BATCH",
+  "generationId": 1,
+  "batchId": 42,
   "epoch": 14,
-  "count": 32
+  "grantId": 0,
+  "sentCount": 3,
+  "omittedCount": 0,
+  "terminalResults": {
+    "5:4:2": "admitted",
+    "5:4:3": "admitted",
+    "5:5:2": "admitted"
+  },
+  "admittedKeys": [
+    "5:4:2",
+    "5:4:3",
+    "5:5:2"
+  ],
+  "residencySeq": 1
 }
 ```
+*Reglas de Validación Estricta en Servidor:*
+- Si `generationId != sessionGenerationId`, `batchId <= 0`, `batchId != activeBatchId`, o `epoch != activeBatchEpoch`, el ACK se descarta sin mutación de estado.
+- Se exige partición completa de resultados terminales (`sentCount + omittedCount == plannedCount`).
+- `admittedKeys` refleja la residencia efectiva en el cliente al emitir la confirmación.
+- La ventana de congestión TCP Vegas se ajusta exactamente una sola vez por lote validado (idempotencia ante reintentos).
+- La sesión transiciona de vuelta a `IDLE`, permitiendo orquestar el siguiente lote (invariante de lote único en vuelo).
 
-### 5.5 Mensaje `ABORT` (Cliente $\to$ Servidor)
+### 5.5 Mensaje `EVICT` (Cliente $\to$ Servidor)
+Emitido por el cliente cuando el algoritmo de reemplazo de caché (SIEVE) desaloja físicamente una tesela residente para liberar memoria:
+```json
+{
+  "type": "EVICT",
+  "generationId": 1,
+  "key": "5:4:2",
+  "residencySeq": 2
+}
+```
+*Efecto en Servidor:*
+- El servidor elimina la clave del conjunto acotado de residencia confirmada (`residentConfirmedKeys`), permitiendo que el despachador vuelva a transmitirla si el cliente reingresa a esa región.
+
+### 5.6 Mensaje `ABORT` (Cliente $\to$ Servidor)
 Emitido por el cliente ante una interrupción abrupta de la navegación para cancelar el procesamiento de la época indicada:
 ```json
 {
@@ -325,7 +387,7 @@ Emitido periódicamente para telemetría de rendimiento y control en el cliente 
 
 ## 6. Máquina de Estados Finita (FSM) del Sistema
 
-El ciclo de vida del cliente y el servidor UHIP v1.0 se modela mediante una Máquina de Estados Finita coordinada:
+El ciclo de vida de la sesión en el servidor UHIP v1.0 y su sincronización con el cliente se modela mediante una Máquina de Estados Finita coordinada con restricción de un único lote en vuelo:
 
 ```
 +-----------------------------------------------------------------------------+
@@ -345,22 +407,37 @@ El ciclo de vida del cliente y el servidor UHIP v1.0 se modela mediante una Máq
 |                (Rx: IMAGE_INFO & Dims)                                      |
 |                           v                                                 |
 |                 +-------------------+                                       |
-|                 |   PRELOAD_BASE    | (Bootstrap Niveles 0..3, Epoch 0)     |
+|                 |   BOOTSTRAP_ROOT  | (Bootstrap Mínimo: Solo Raíz 0:0:0)   |
 |                 +-------------------+                                       |
 |                           |                                                 |
-|                 (85 Teselas en RAM)                                         |
+|                 (Raíz Lista en RAM)                                         |
 |                           v                                                 |
-|        +------->+-------------------+<-------+                              |
-|        |        |  IDLE_NAVIGATING  |        |                              |
-|        |        +-------------------+        |                              |
-|        |                  |                  |                              |
-|        |           (View Moved /             |                              |
-| (Batch Done & ACK)  Zoom Changed)      (ABORT Event /                       |
-|        |                  v             Epoch Changed)                      |
-|        |        +-------------------+        |                              |
-|        |        |  STREAMING_BATCH  |        |                              |
-|        +--------| (AIMD Pacing Tx)  |--------+                              |
-|                 +-------------------+                                       |
+|        |        |   SESSION_IDLE    |                                       |
+|        |        +-------------------+                                       |
+|        |                  |                                                 |
+|        |           (Demanda Activa > 0)                                     |
+|        |                  v                                                 |
+|        |        +-------------------+                                       |
+|        |        |     PREPARING     | (Construcción Candidatos y Oferta)    |
+|        |        +-------------------+                                       |
+|        |                  |                                                 |
+|        |            (BATCH_OFFER)                                           |
+|        |                  v                                                 |
+|        |        +-------------------+                                       |
+|        |        |  WAITING_CREDIT   | (Espera BATCH_ACCEPT con grantId)     |
+|        |        +-------------------+                                       |
+|        |             |         |                                            |
+|        | (BATCH_DEFER)         | (BATCH_ACCEPT Válido)                      |
+|        |             |         v                                            |
+|        |             |  +-------------------+                               |
+| (ACK Válido /        |  |      SENDING      | (Transmisión BATCH_BEGIN ->   |
+| Timeout 5s)          |  +-------------------+  TILE_DATA -> BATCH_END)      |
+|        |             |         |                                            |
+|        |             | (BATCH_END Emitido)                                  |
+|        |             |         v                                            |
+|        |             |  +-------------------+                               |
+|        +-------------+--|   AWAITING_ACK    | (Bloqueo: No hay Lotes Intercal)
+|                         +-------------------+                               |
 |                                                                             |
 +-----------------------------------------------------------------------------+
 ```
@@ -369,12 +446,15 @@ El ciclo de vida del cliente y el servidor UHIP v1.0 se modela mediante una Máq
 
 | Estado Origen | Evento / Disparador | Condición de Guarda | Acción Ejecutada | Estado Destino |
 | :--- | :--- | :--- | :--- | :--- |
-| `DISCONNECTED` | Invocación de `connect()` | Sockets web disponibles | Apertura simultánea de Control WS y Data WS | `HANDSHAKE_INIT` |
-| `HANDSHAKE_INIT` | Recepción de `IMAGE_INFO` | Metadatos válidos ($W>0, H>0$) | Configuración de dimensiones y cálculo de Cover Floor | `PRELOAD_BASE` |
-| `PRELOAD_BASE` | Recepción de 85 teselas base | `epoch == 0` y $z \in [0..3]$ | Registro incondicional en memoria RAM como inmortales | `IDLE_NAVIGATING` |
-| `IDLE_NAVIGATING`| Desplazamiento de cámara o zoom | Coordenadas fuera de caché local | Envío de `SYNC_VIEW`, cálculo foveal Manhattan | `STREAMING_BATCH` |
-| `STREAMING_BATCH`| Recepción completa de lote | `pending == 0` | Envío de `ACK_BATCH`, ajuste ventana TCP Vegas | `IDLE_NAVIGATING` |
-| `STREAMING_BATCH`| Salto de zoom o pulsación Abort | `epoch_new > epoch_active` | Purgado de cola en servidor, cancelación de tramas | `IDLE_NAVIGATING` |
+| `DISCONNECTED` | Invocación de `connect()` | Sockets web disponibles | Apertura de Control WS (8081) y emisión de `HELLO` | `HANDSHAKE_INIT` |
+| `HANDSHAKE_INIT` | Recepción de `SESSION_READY` | Metadatos válidos ($W>0, H>0$) | Conexión de Data WS (8082) con `generationId` UUID | `DATA_CONNECTING` |
+| `DATA_CONNECTING` | Recepción de `DATA_READY` | Socket datos asociado | Envío de demanda `SYNC_VIEW` y arranque de visor | `SESSION_IDLE` |
+| `SESSION_IDLE` | Desplazamiento de cámara o zoom | Demanda pendiente $> 0$ en cola | Construcción de candidatos y emisión de `BATCH_OFFER` | `WAITING_CREDIT` |
+| `WAITING_CREDIT` | Recepción de `BATCH_ACCEPT` | `grantId > 0` $\land$ claves válidas | Reserva de cuota y transmisión de `BATCH_BEGIN` (0x13) | `SENDING` |
+| `WAITING_CREDIT` | Recepción de `BATCH_DEFER` / Timeout | Presupuesto cliente agotado | Liberación de tokens y reconciliación | `SESSION_IDLE` |
+| `SENDING` | Última tesela física o de omisión | Tareas del lote procesadas | Emisión de `BATCH_END` (0x14) | `AWAITING_ACK` |
+| `AWAITING_ACK` | Recepción de `ACK_BATCH` estructurado | Identidad, manifiesto y secuencias válidas | Cálculo de RTT, muestra única Vegas CWND | `SESSION_IDLE` |
+| `AWAITING_ACK` | Expiración de temporizador de lote (5s)| `t > 5000 ms` sin ACK | Retroceso Vegas ($\text{CWND}=\max(16, \text{CWND}/2)$), timeout | `SESSION_IDLE` |
 
 ---
 
@@ -483,27 +563,30 @@ $$\text{camX}_{t+1} = \text{camX}_t - v_{x, t+1}, \quad \text{camY}_{t+1} = \tex
 
 Si $|v_x| < 0.1$ y $|v_y| < 0.1$, la velocidad se trunca exactamente a 0, evitando oscilaciones infinitesimales que consuman ciclos de GPU.
 
-### 8.4 La Pirámide Inmortal de Vista Previa (Niveles $z \in [0..3]$)
+### 8.4 Bootstrap Mínimo de Raíz (Nivel $z=0$)
 
-El fallo histórico de los visores convencionales al hacer zoom out rápido reside en que la periferia recién expuesta no existe en memoria RAM. Para resolver esto, el servidor UHIP v1.0 transmite en segundo plano al iniciar la sesión las **85 teselas de los niveles 0, 1, 2 y 3** (peso combinado: **981 KB**):
+Para erradicar la sobrecarga de ancho de banda y la saturación del presupuesto de memoria provocadas por descargas masivas iniciales de niveles enteros, UHIP v1.0 implementa un bootstrap mínimo determinista:
+- Al conectarse el cliente (`IMAGE_INFO`), si `maxZoom > 0`, se solicita de inmediato únicamente la tesela raíz `0:0:0` (peso típico: $\sim 4\text{ KB}$).
+- La tesela raíz proporciona el respaldo ancestral universal inmediato para toda la superficie de la imagen mientras se resuelven las solicitudes foveales de alta resolución de la ventana visible actual.
+- Se elimina cualquier volcado masivo incondicional de los niveles $0..3$ (85 teselas), garantizando que todo el tráfico posterior sea estrictamente guiado por la ventana visible y la cinemática del usuario.
 
-* **Nivel 0:** 1 tesela ($1 \times 1$) - 4.2 KB
-* **Nivel 1:** 4 teselas ($2 \times 2$) - 34.7 KB
-* **Nivel 2:** 16 teselas ($4 \times 4$) - 169.1 KB
-* **Nivel 3:** 64 teselas ($8 \times 8$) - 773.7 KB
+### 8.5 Algoritmo de Renderizado Determinista con Respaldo Ancestral y Geometría Rectangular Exacta
 
-Estas 85 teselas se marcan como **inmortales** en la caché del cliente y se protegen incondicionalmente contra cualquier evicción. Como resultado, **el 100% de la superficie de la imagen en resolución 2K ($2048 \times 1536$ px) reside en memoria RAM de forma permanente**. Al alejar la vista, la latencia de red para enfocar la visión completa es de **0.000 ms**, garantizando una transición uniforme y continua idéntica a EarthCam.
+El renderizador de UHIP v1.0 abandona suposiciones de imágenes estrictamente cuadradas ($2^z \times 2^z$) y adopta dimensiones rectangulares exactas para cada nivel de la pirámide:
 
-### 8.5 Algoritmo de Renderizado Determinista con Respaldo Ancestral
+$$W(z) = \max(1, \lceil W_{\text{orig}} / 2^{Z_{\max} - z} \rceil), \quad H(z) = \max(1, \lceil H_{\text{orig}} / 2^{Z_{\max} - z} \rceil)$$
+$$\text{cols}(z) = \lceil W(z) / T \rceil, \quad \text{rows}(z) = \lceil H(z) / T \rceil$$
 
-El renderizador de UHIP v1.0 abandona las pasadas múltiples desarticuladas y adopta el Algoritmo Canónico Determinista con Respaldo Ancestral:
+Para teselas ubicadas en los bordes de la imagen, el tamaño rasterizado no se estira arbitrariamente, sino que conserva su dimensión física exacta:
+
+$$W_t(z, x) = \min(T, W(z) - x \cdot T), \quad H_t(z, y) = \min(H, H(z) - y \cdot T)$$
 
 ```
 +-----------------------------------------------------------------------------+
 |        ALGORITMO CANÓNICO DE RECORTE ANCESTRAL EN TESELAS FALTANTES         |
 +-----------------------------------------------------------------------------+
 |                                                                             |
-|   Tesela Ancestral Nivel (z-1)              Tesela Destino Faltante (z)     |
+|   Tesela Ancestral Nivel (z_a)              Tesela Destino Faltante (z)     |
 |   +-----------------------+                 +-----------------------+       |
 |   | (sx,sy)               |                 | (dx,dy)               |       |
 |   |   +-------+           |                 |                       |       |
@@ -511,7 +594,8 @@ El renderizador de UHIP v1.0 abandona las pasadas múltiples desarticuladas y ad
 |   |   |Rect   |           |  ============>  |                       |       |
 |   |   +-------+           |  Bicúbico 2x    |                       |       |
 |   |         (sw,sh)       |                 |               (dw,dh) |       |
-|   +-----------------------+                 +-----------------------+       |
+|   |   +-------------------+                 +-----------------------+       |
+|   +-----------------------+                                                 |
 |                                                                             |
 +-----------------------------------------------------------------------------+
 ```
@@ -521,35 +605,32 @@ Para cada celda de cuadrícula $(x, y)$ visible en el nivel objetivo $z$:
 2. Si no reside en caché, se itera en reversa por los niveles ancestros ($z_a = z - 1$ descendiendo hasta $0$):
    * Se calcula el factor de escala: $\Delta z = z - z_a$ y $\text{divisor} = 2^{\Delta z}$.
    * Se localiza la coordenada del ancestro contenedor: $x_a = \lfloor x / \text{divisor} \rfloor$, $y_a = \lfloor y / \text{divisor} \rfloor$.
-   * Si la tesela $(z_a, x_a, y_a)$ está disponible (garantizado para $z_a \le 3$), se calcula el sub-rectángulo de recorte matemático:
+   * Si la tesela $(z_a, x_a, y_a)$ está disponible en caché, se computa el sub-rectángulo de recorte matemático exacto:
+     $$sw = \frac{W_t(z_a, x_a)}{\text{divisor}}, \quad sh = \frac{H_t(z_a, y_a)}{\text{divisor}}$$
+     $$sx = (x \pmod{\text{divisor}}) \times sw, \quad sy = (y \pmod{\text{divisor}}) \times sh$$
+3. Se proyecta dicho cuadrante sobre las coordenadas de pantalla:
+   $$\text{ctx.drawImage}(\text{bitmap}, sx, sy, sw, sh, dx, dy, dw, dh)$$
 
-$$sw = \frac{W_{\text{bitmap}}}{\text{divisor}}, \quad sh = \frac{H_{\text{bitmap}}}{\text{divisor}}$$
-$$sx = (x \pmod{\text{divisor}}) \times sw, \quad sy = (y \pmod{\text{divisor}}) \times sh$$
-
-Se proyecta dicho cuadrante sobre las coordenadas de pantalla:
-
-$$\text{ctx.drawImage}(\text{bitmap}, sx, sy, sw, sh, dx, dy, dw, dh)$$
-
-Este algoritmo matemático elimina de raíz el efecto de escalera, los recortes rectangulares y los fondos negros.
+Este algoritmo matemático elimina de raíz el efecto de escalera, los recortes rectangulares desalineados y los fondos negros.
 
 ---
 
 ## 9. Gestión de Recursos y Política de Evicción en el Cliente
 
-### 9.1 Capacidad Dinámica Acotada de la Caché LRU
+### 9.1 Caché de Alto Rendimiento SIEVE (Zhang et al., NSDI 2024) con Presupuesto Estricto en Bytes
 
-La caché de teselas implementa un diccionario ordenado con desalojo por antigüedad de uso (**Least Recently Used - LRU**). Para balancear el rendimiento de 144 FPS con la huella física de memoria en terminales de recursos limitados, la capacidad máxima se ajusta dinámicamente:
+La caché de teselas en el cliente implementa el algoritmo **SIEVE** (Zhang et al., NSDI 2024), sustituyendo el reordenamiento de punteros de LRU por una lista circular doblemente enlazada con un bit de visita (`visited`) y un puntero de evicción tipo reloj (`hand`). Las lecturas se ejecutan en $O(1)$ sin mutación de punteros, y se separan estrictamente las consultas de dibujo de alta frecuencia (`peek()`, 144 FPS) de los registros de demanda real de red (`recordDemand()`).
 
-$$\text{maxTiles} = \max(1000, \lceil \text{visibleCount} \times 6 \rceil)$$
+Para garantizar una huella física de memoria acotada y predecible en navegadores web, se aplican dos límites estrictos:
+1. **Presupuesto Acotado en Bytes ($B \le 128\text{ MiB}$):** Cada tesela se computa en memoria rasterizada cruda como $\text{ancho} \times \text{alto} \times 4\text{ bytes}$ ($256 \times 256 \times 4 = 256\text{ KiB}$).
+2. **Capacidad Máxima Secundaria:** Límite máximo estricto de 512 teselas simultáneas.
 
-Con un piso de 1,000 teselas, la memoria utilizada para almacenar mapas de bits decodificados se mantiene estable en aproximadamente **100 MB a 140 MB**, un costo insignificante para cualquier navegador moderno.
+### 9.2 Protección Acotada por Fotograma y Reemplazo Seguro
 
-### 9.2 Blindaje de Inmunidad de Memoria
-
-El algoritmo de evicción evalúa tres niveles de protección antes de considerar descartar una tesela:
-1. **Inmunidad de Vista Previa:** Cualquier tesela con nivel $z \le 3$ o época 0 está exenta de evicción.
-2. **Inmunidad de Visibilidad:** Las teselas que intersectan con la ventana visible actual (`visibleKeys`) nunca se descartan.
-3. **Bloqueo Temporal de Nivel (*Level Locking*):** Durante transiciones de zoom, el nivel previo completo se congela temporalmente para evitar parpadeos visuales hasta que el nuevo nivel confirme cobertura.
+El mecanismo de protección contra evicción se ajusta de acuerdo con las siguientes invariantes:
+1. **Protección Restringida a la Ventana Visible (`currentFrameProtectedKeys`):** Únicamente las teselas requeridas en el fotograma actualmente en renderizado quedan temporalmente protegidas durante la pasada de dibujo. Se eliminan las inmunidades globales permanentes para niveles $z \le 3$ o niveles completos congelados (`lockedLevel`).
+2. **Reemplazo Seguro de Claves (*Safe In-Place Replacement*):** Cuando llega una actualización para una clave existente (por ejemplo, una versión de mayor calidad o decodificación posterior), se ejecuta un intercambio atómico de valor: el mapa de bits obsoleto se retira y se destruye de forma segura con `ImageBitmap.close()`, sin colocar en riesgo de evicción ni cerrar prematuramente el nuevo mapa de bits ingresante.
+3. **Rechazo ante Sobredemanda Ineludible:** Si el presupuesto de memoria está colmado y todas las teselas residentes están actualmente protegidas por el fotograma activo, la admisión de nuevas teselas se cancela ordenadamente y su mapa de bits se libera de inmediato, impidiendo el desbordamiento de memoria RAM.
 
 ### 9.3 Liberación Forzada de Texturas GPU (`ImageBitmap.close()`)
 

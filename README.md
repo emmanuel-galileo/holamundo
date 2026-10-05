@@ -29,7 +29,7 @@ Sistema distribuido de alto rendimiento para navegación e inspección de imáge
          ▼                               │
    TrafficEngine                         ▼
  (Slow Start + AIMD)                TileManager
-                                 (Disk & SoftRef Cache)
+                                 (Disk & S3-FIFO Cache)
                                          │
                                          ▼
                                    /tiles/{z}/{x}_{y}.jpg
@@ -37,11 +37,11 @@ Sistema distribuido de alto rendimiento para navegación e inspección de imáge
 
 ### Principios de Diseño
 1. **Canales Separados (Control y Datos):** Inspirado en RFC 959 (FTP) y RFC 2326 (RTSP). El canal de control procesa señalización JSON ultraligera (`SYNC_VIEW`, `ACK_BATCH`, `ABORT`, `IMAGE_INFO`), mientras el canal de datos transmite teselas en binario puro con baja latencia.
-2. **Control de Congestión en Capa 7 (Aplicación):** Algoritmo **Slow Start + AIMD** (Aumento Aditivo / Disminución Multiplicativa) que adapta dinámicamente la ventana de despacho (`cwnd`) de teselas.
-3. **Cola de Despacho Manhattan:** Las teselas se ordenan según su distancia al centro del viewport `|x - cx| + |y - cy|`, enviando primero las teselas focales.
-4. **Navegación Cinemática EarthCam (Modo Cover, Inercia & Debounce de Red):** Escala continua en punto flotante con piso de zoom dinámico (`minScale = max(vw/w, vh/h)`) que garantiza que la imagen cubra siempre el 100% de la pantalla sin vacíos negros ni reducción a estampilla. Arrastre con inercia cinemática amortiguada (fricción `0.92/frame`). Animación visual a 144 FPS desacoplada de la red mediante temporizador de ráfaga de rueda (`wheelNetworkTimer`, 120 ms) que previene la tormenta de épocas y preserva la fluidez lateral.
-5. **Capa Base Inmortal & Retención de Nivel Estable (Cero Pantallazo Negro ni Efecto Plastilina):** La tesela raíz `0:0:0` se mantiene protegida de por vida en GPU, inmune a descartes de época, y se proyecta como fondo continuo e incondicional debajo de todo el mundo visual en cada frame. El renderizador retiene el último nivel estable confirmado (`lastStableLevel`) bloqueando su evicción (`cache.lockLevel`) y solo promueve un nuevo nivel cuando sus 4 teselas centrales (o el 75% del viewport) están decodificadas en caché, garantizando un lienzo continuo sin apagones ni parpadeos negros.
-6. **Caché Dinámico con Bloqueo de Nivel y Evicción Protegida:** Capacidad elástica adaptada al viewport (`max(120, visibleTiles * 2.5)`). Las teselas actualmente en pantalla, los ancestros de respaldo y el nivel previo bloqueado (`lockedLevel`) quedan blindados contra desalojo y llamadas prematuras a `ImageBitmap.close()`.
+2. **Control de Congestión en Capa 7 (Aplicación):** Algoritmo **TCP Vegas** (Brakmo & Peterson, 1994) que adapta dinámicamente la ventana de despacho (`cwnd`) midiendo RTT y volumen de cola en tránsito (*Diff*), con restricción estricta de un solo lote en vuelo mediante máquina de estados (`IDLE`, `PREPARING`, `SENDING`, `AWAITING_ACK`).
+3. **Cola de Despacho Manhattan y Reconciliación de Época:** Las teselas se ordenan según su distancia al centro del viewport `|x - cx| + |y - cy|`. Todo desplazamiento de la cámara (*pan* o *zoom*) incrementa la época monotónica y reconcilia la cola descartando tareas fuera de pantalla.
+4. **Navegación Cinemática EarthCam & Prefetch Adaptativo AMP (FAST 2007):** Escala continua en punto flotante con piso dinámico Cover (`minScale = max(vw/w, vh/h)`) que garantiza que la imagen cubra siempre el 100% de la pantalla sin vacíos negros ni reducción a estampilla. Arrastre con inercia cinemática amortiguada (fricción `0.92/frame`) desacoplada a 144 FPS. Prefetch adaptativo multi-stream (**AMP**, Gill & Bathen, FAST 2007) que modela el desplazamiento en bandas de teselas con grado adaptativo $p \in [0..4]$ y distancia de disparo $g$, reseteándose ante frenado o inversión de dirección.
+5. **Bootstrap Mínimo de Raíz & Geometría Rectangular Arbitraria:** Al iniciar sesión se solicita únicamente la raíz `0:0:0` ($\sim 4\text{ KB}$), eliminando volcados masivos. El renderizador calcula dimensiones exactas para cada nivel de la pirámide (`PyramidGeometry`), conservando bordes físicos exactos sin estiramiento y realizando recortes de cuadrantes matemáticos sobre ancestros.
+6. **Caché SIEVE en Cliente con Presupuesto Estricto (128 MiB, NSDI 2024):** Lista circular con bit de visita (`visited`) y puntero de reloj `hand`. Presupuesto acotado a 128 MiB (4 bytes/px) y 512 entradas. Reemplazo seguro atómico de claves sin cierre erróneo de texturas nuevas, protección acotada por fotograma (`currentFrameProtectedKeys`) y destrucción física forzada mediante `ImageBitmap.close()`.
 7. **Interfaz Cinemática Minimalista EarthCam:** Barra superior delgada con título y estado, dock flotante inferior centrado con botones de navegación/pantalla completa, panel de telemetría colapsable (oculto por defecto) y píldora flotante de FPS.
 8. **Cero Dependencias CDN (100% Offline):** Servidor HTTP estático nativo `HttpServer` que despacha HTML5 Canvas, CSS3 con Glassmorphism y módulos Vanilla ES6.
 
@@ -65,26 +65,45 @@ Proyecto Imagenes CC8/
 │   │   ├── DataWebSocket.java    # Canal de datos binario (:8082)
 │   │   └── WsUtils.java          # Extracción de clientId y utilidades
 │   ├── session/
-│   │   ├── ClientSession.java  # Pipeline de despacho por cliente
+│   │   ├── ClientSession.java  # Pipeline de despacho con SessionState machine
+│   │   ├── ActiveBatch.java    # Registro inmutable de lote y validación de ACK
+│   │   ├── BoundedKeySet.java  # Conjunto acotado FIFO para deduplicación de residencia
+│   │   ├── TransferContext.java# Contexto de transferencia con adquisición de claves (C1)
 │   │   └── SessionManager.java # Registro concurrente de sesiones
 │   ├── traffic/TrafficEngine.java# Motor de congestión Capa 7 TCP Vegas (RTT y Diff)
-│   ├── dispatch/TileDispatcher.java # Cola de prioridad Manhattan
-│   ├── storage/TileManager.java# I/O de disco, caché SoftRef y generador sintético
-│   ├── protocol/UhipCodec.java # Serialización binaria UHIP v1.0
-│   └── tools/TileCutter.java   # Cortador de imágenes y generador sintético
+│   ├── dispatch/TileDispatcher.java # Cola de prioridad Manhattan y reconciliación pan
+│   ├── storage/
+│   │   ├── S3FifoCache.java    # Caché S3-FIFO acotado en bytes con 3 colas (S, M, G, SOSP '23)
+│   │   └── TileManager.java    # I/O de disco, miss coalescing y caché S3-FIFO
+│   ├── pyramid/
+│   │   ├── PyramidGeometry.java# Modelo matemático exacto de pirámide rectangular
+│   │   └── BurtAdelsonReducer.java # Reducción 5-tap Burt–Adelson REDUCE (1983)
+│   ├── protocol/UhipCodec.java # Serialización binaria UHIP (TILE_DATA, BATCH_BEGIN, BATCH_END)
+│   └── tools/
+│       ├── TileCutter.java     # Cortador multirresolución con Burt-Adelson
+│       └── VipsTileSlicer.java  # Slicer de streaming libvips con fallback Java
 │
 ├── src/test/java/com/uhip/
-│   └── TestUhipClient.java     # Test de integración cliente-servidor
+│   ├── TestPendingCorrections.java    # Verificación unitaria de los 7 errores (C1 a C5, E1 a E7)
+│   ├── TestFunctionalCorrections.java # Verificación unitaria de las 5 correcciones
+│   ├── TestPyramidGeometry.java       # Verificación matemática de dimensiones
+│   ├── TestUhipClient.java            # Test de integración cliente-servidor e2e
+│   ├── TestMultiClient.java           # Test concurrente multi-cliente en paralelo
+│   ├── TestS3FifoCache.java           # Test unitario S3-FIFO (SOSP 2023)
+│   └── TestBurtAdelsonReducer.java    # Test unitario Burt-Adelson REDUCE (1983)
 │
 ├── public/                     # Frontend Vanilla (Cero frameworks)
-│   ├── index.html              # Lienzo HTML5 Canvas y HUD de telemetría
+│   ├── index.html              # Lienzo HTML5 Canvas y HUD de telemetría SIEVE
 │   ├── style.css               # Estilos glassmorphism en tema oscuro
+│   ├── test_cache_regression.html # Suite de regresión del caché en navegador
 │   └── js/
 │       ├── main.js             # Bucle requestAnimationFrame y orquestador
-│       ├── viewport.js         # Pan, zoom al cursor y prefetch direccional
-│       ├── protocol.js         # Cliente dual WebSocket y decodificación JPEG
-│       ├── cache.js            # Caché LRU con ImageBitmap.close()
-│       ├── renderer.js         # Renderizado en canvas 2D
+│       ├── config.js           # Configuración desacoplada (CLIENT_CONFIG)
+│       ├── geometry.js         # Geometría rectangular y recorte ancestral
+│       ├── viewport.js         # Pan, zoom al cursor y prefetch adaptativo AMP (FAST '07)
+│       ├── protocol.js         # Cliente dual WebSocket y envelopes BATCH_BEGIN/END
+│       ├── cache.js            # Caché SIEVE (NSDI '24) con presupuesto 128 MB
+│       ├── renderer.js         # Renderizado en canvas 2D con lecturas peek()
 │       └── hud.js              # Overlay de métricas en tiempo real
 │
 ├── tiles/                      # Pirámide de teselas (/tiles/{zoom}/{x}_{y}.jpg)
@@ -214,30 +233,52 @@ Cada tesela en el canal de datos se transmite en un frame binario con el siguien
 |---|---|---|
 | **TCP Vegas en Capa 7 (Brakmo & Peterson)** | `TrafficEngine.java` | Regula CWND midiendo RTT por lote en lugar de esperar pérdidas. Compara throughput esperado ($CWND / baseRTT$) contra real ($CWND / actualRTT$) para estimar el volumen de cola $Diff$. Con $\alpha=2.0$ y $\beta=5.0$, acelera aditivamente si $Diff < \alpha$, desacelera si $Diff > \beta$ y estabiliza la ventana en equilibrio óptimo ($min=16, init=32, max=256$). Preserva ventana ante `ABORT`. |
 | **Cola Manhattan** | `TileDispatcher.java` | Prioridad $= \|tileX - centerX\| + \|tileY - centerY\|$. Las teselas centrales se transmiten primero. Purga instantánea de cola en `clearStaleQueueIfEpochAdvanced` antes de sincronizar época. |
-| **Calibración de Nitidez & Zoom Inercial** | `viewport.js` | Densidad de píxeles calibrada: promueve a $z+1$ si el estiramiento supera $1.25\times$ y asegura nivel Cover que iguala o supera la resolución del monitor (ej. Nivel 3 de 2048 px para 1080p). Amortiguación `lerp(0.15)` e inercia cinemática amortiguada. |
+| **Caché SIEVE en Cliente (NSDI 2024)** | `cache.js` | Lista circular con bit de visita (`visited`) y puntero de reloj `hand` (Zhang et al., NSDI 2024). Lecturas $O(1)$ sin mutación de enlaces, desacople de renderizado `peek()` vs demandas `recordDemand()`, retención de favoritos y desalojo físico con `ImageBitmap.close()`. |
+| **Caché Servidor S3-FIFO + Coalescing (SOSP 2023)** | `S3FifoCache.java`<br>`TileManager.java` | Almacenamiento acotado con tres colas FIFO ($S \sim 10\%$, $M \sim 90\%$, $G$ ghost keys) y saturación de frecuencia (0..3) (Yang et al., SOSP 2023). Coalescencia atómica de lecturas de disco concurrentes mediante `CompletableFuture inFlightReads`. |
+| **Prefetch Adaptativo AMP en Bandas (FAST 2007)** | `viewport.js` | Modela la navegación en bandas continuas de teselas (Gill & Bathen, FAST 2007). Adapta dinámicamente el grado $p \in [0..4]$ y distancia de disparo $g$ según la velocidad, con anclaje foveal central estricto y cancelación inmediata ante frenado o inversión de sentido. |
+| **Pirámides Burt–Adelson REDUCE (1983)** | `BurtAdelsonReducer.java`<br>`TileCutter.java` | Reducción multirresolución separable 5-tap con kernel $[1, 5, 8, 5, 1] / 20$, 2 muestras de halo con reflexión espejada y acumulador entero de 32 bits antes de cuantización final con redondeo $+200 / 400$. |
 | **Relevo Visual Continuo (Sin caída a L0)** | `renderer.js` | Durante transiciones de zoom, retiene dibujadas las teselas del último nivel estable escaladas en Canvas y prohíbe sustituir el lienzo por L0 si existe cualquier nivel intermedio en memoria. |
-| **Caché Dinámico Protegido** | `cache.js` | Capacidad dinámica proporcional a las teselas visibles ($\ge \text{visible} \times 2.5$, base 120). Evicción LRU que nunca expulsa teselas visibles ni ancestros en uso. |
-| **Prefetch Direccional** | `viewport.js` | Evalúa el vector de velocidad $(dx, dy)$ al arrastrar con el mouse; expande el bounding box en la dirección del movimiento para solicitar teselas antes de que sean visibles. |
 | **Cancelación de Época** | `TileDispatcher` y `ClientSession` | Al mover bruscamente la cámara o cambiar de zoom, se incrementa la época (`epoch`). El servidor y cliente purgan automáticamente cualquier tesela con época obsoleta. |
 
 ---
 
 ## 🧪 Pruebas Automatizadas
 
-Se incluye un cliente de prueba de integración de extremo a extremo que verifica la conexión de ambos sockets, el despacho de teselas, la progresión de `cwnd` y el manejo de `ABORT`:
+Se incluyen suites de pruebas automatizadas que verifican los algoritmos con aserciones habilitadas (`-ea`):
+
+### 1. Pruebas Unitarias de Algoritmos y Correcciones Funcionales:
 ```cmd
-javac -d target/classes -cp "lib/*;src/main/java" src/test/java/com/uhip/TestUhipClient.java
-java -cp "target/classes;lib/*" com.uhip.TestUhipClient
+java -ea -cp "target/uhip-server.jar;target/test-classes;lib/*" com.uhip.TestFunctionalCorrections
+java -ea -cp "target/uhip-server.jar;target/test-classes;lib/*" com.uhip.TestPyramidGeometry
+java -ea -cp "target/uhip-server.jar;target/test-classes;lib/*" com.uhip.TestS3FifoCache
+java -ea -cp "target/uhip-server.jar;target/test-classes;lib/*" com.uhip.TestBurtAdelsonReducer
 ```
 Resultado verificado:
-- Handshake exitoso en ambos canales.
-- Recepción y decodificación de teselas en orden Manhattan.
-- Confirmación de crecimiento exponencial en Slow Start (CWND de 1 a 2).
-- Disminución multiplicativa ante ABORT (`ssthresh=2`, `cwnd=1`, purga de cola).
+- **Correcciones Funcionales:** Validación de envoltorios `BATCH_BEGIN` (0x13) y `BATCH_END` (0x14), restricción estricta de un solo lote en vuelo, rechazo de ACKs desfasados y sustitución limpia de demanda foveal en movimientos pan.
+- **Geometría Rectangular:** Dimensiones discretas exactas, acotación sin estiramiento y cálculos precisos de recorte ancestral.
+- **S3-FIFO:** Control estricto de presupuesto en bytes, promoción de $S \to M$ ante frecuencia $> 1$, absorción en $G$ y desalojo limpio de memoria.
+- **Burt-Adelson REDUCE:** Conservación de energía luminosa en 5-tap separable, soporte exacto de dimensiones impares y escalado $\lceil W/2 \rceil, \lceil H/2 \rceil$.
 
-### Verificación de Cinemática y Visualización (EarthCam):
-- **Piso de Zoom (Cover):** `minScale = Math.max(canvas.width / originalWidth, canvas.height / originalHeight)`. La fotografía panorámica siempre ocupa el 100% de la ventana sin vacíos negros ni reducción a estampilla.
-- **Clamping Estricto:** Coordenadas `camX` y `camY` acotadas en `[0, maxCamX]` y `[0, maxCamY]` (cero valores negativos).
-- **Inercia con Fricción:** Velocidad de arrastre `(vx, vy)` conservada en `mouseup` y desacelerada con factor `0.92` por cuadro hasta reposo.
-- **Acotación de Teselas:** Despacho acotado estrictamente a las dimensiones reales rectangulares de la imagen (`maxTileX = ceil(w * 2^(z-maxZoom) / 256)`), eliminando teselas fantasma y líneas fuera de bordes.
+### 2. Integración de Red y Control de Congestión End-to-End:
+```cmd
+# Terminal 1: Iniciar servidor
+java -jar target/uhip-server.jar tiles
+
+# Terminal 2: Ejecutar cliente de prueba e2e
+java -ea -cp "target/test-classes;target/uhip-server.jar;lib/*" com.uhip.TestUhipClient
+
+# Terminal 2: Ejecutar prueba de concurrencia multi-cliente
+java -ea -cp "target/test-classes;target/uhip-server.jar;lib/*" com.uhip.TestMultiClient
+```
+Resultado verificado:
+- Handshake exitoso en canales de control (JSON) y datos (binario UHIP v1.0).
+- Flujo binario estructurado: `BATCH_BEGIN` $\to$ `TILE_DATA` $\to$ `BATCH_END` $\to$ `ACK_BATCH`.
+- Confirmación de crecimiento de ventana CWND en régimen de flujo continuo regulado por TCP Vegas.
+- Múltiples clientes concurrentes sirviendo niveles de zoom independientes en paralelo sin interferencia ni contención.
+
+### 3. Regresión de Caché y Evicción en Navegador:
+Abrir [`public/test_cache_regression.html`](file:///C:/Users/Emmanuel%20Santos/Desktop/proyecto-imagenes-cc8/public/test_cache_regression.html) en cualquier navegador moderno para verificar en tiempo real:
+- Presupuesto estricto de 128 MiB (4 bytes/px) y límite de 512 teselas.
+- Reemplazo seguro de claves en caliente sin invocar `close()` sobre el mapa de bits entrante.
+- Protección temporal acotada a las teselas visibles en el fotograma actual.
 

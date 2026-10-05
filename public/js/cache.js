@@ -1,187 +1,446 @@
 /**
- * Dynamic LRU Tile Cache with Viewport-Protected Eviction and Immortal Base Layer.
- * Guarantees memory is bounded while protecting visible tiles and the z=0 root tile
- * from being evicted, ensuring zero black-screen transitions during zoom out.
+ * Sieve Node representing a cached tile with explicit raster byte accounting.
+ * Conforms to SIEVE cache eviction algorithm (Zhang et al., NSDI 2024).
+ */
+class SieveNode {
+    constructor(key, value, bytes) {
+        this.key = key;
+        this.value = value;
+        this.bytes = bytes;
+        this.visited = false;
+        this.prev = null;
+        this.next = null;
+    }
+}
+
+/**
+ * Bounded Application-Managed Tile Cache with SIEVE eviction (NSDI 2024).
+ * Enforces strict memory budgets, safe bitmap replacement without closing new instances,
+ * and frame-bounded protection.
  */
 export class TileCache {
     /**
-     * @param {number} baseCapacity Base capacity for tiles in memory (default 1000).
+     * @param {number} maxBytes Budget in bytes (default 128 MiB = 134,217,728).
+     * @param {number} maxEntries Secondary limit on resident entries (default 512).
      */
-    constructor(baseCapacity = 1000) {
-        this.baseCapacity = baseCapacity;
-        this.maxTiles = baseCapacity;
-        /** @type {Map<string, ImageBitmap>} */
+    constructor(maxBytes = 128 * 1024 * 1024, maxEntries = 512) {
+        this.maxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 128 * 1024 * 1024;
+        this.maxEntries = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.floor(maxEntries) : 512;
+        this.currentBytes = 0; // resident raster bytes
+        this.borrowedRetiredBytes = 0;
+        this.pendingJpegBytes = 0;
+        this.pendingDecodeBytes = 0;
+        this.grantedBytes = 0;
+
+        /** @type {Map<string, SieveNode>} */
         this.map = new Map();
-        /** @type {Set<string>} */
+
+        this.head = null;
+        this.tail = null;
+        this.hand = null;
+
+        /** @type {Set<string>} Keys currently visible in viewport */
         this.visibleKeys = new Set();
-        /** @type {Set<string>} Immortal keys never evicted (base layer z=0) */
-        this.immortalKeys = new Set();
-        /** @type {number} Zoom level temporarily protected from eviction during transitions */
-        this.lockedLevel = -1;
+        /** @type {Set<string>} Immortal keys (e.g. root '0:0:0') */
+        this.immortalKeys = new Set(['0:0:0']);
+        /** @type {Set<SieveNode>} Nodes borrowed during current frame */
+        this.frameBorrows = new Set();
+        /** @type {Array<{bitmap: ImageBitmap, bytes: number}>} Bitmaps waiting for borrow release */
+        this.retiredBitmaps = [];
+
+        this.onEvict = null;
+        this.insufficientCapacity = this.maxBytes < (256 * 256 * 4);
+
         this.evictionCount = 0;
+        this.demandHits = 0;
+        this.renderHits = 0;
+        this.rejections = 0;
     }
 
-    /**
-     * Locks all tiles belonging to a specific zoom level to protect them during transitions.
-     * @param {number} zoomLevel
-     */
-    lockLevel(zoomLevel) {
-        this.lockedLevel = zoomLevel;
+    borrow(key) {
+        const node = this.map.get(key);
+        if (!node) return null;
+        node.visited = true;
+        this.frameBorrows.add(node);
+        this.renderHits++;
+        return node.value;
     }
 
-    /**
-     * Unlocks the previously protected zoom level once the new level is confirmed.
-     */
-    unlockLevel() {
-        this.lockedLevel = -1;
+    releaseFrameBorrows() {
+        this.frameBorrows.clear();
+        this.flushRetiredBitmaps();
     }
 
-    /**
-     * Marks a cache key as immortal (protected from all eviction).
-     * @param {string} key
-     */
+    flushRetiredBitmaps() {
+        if (this.retiredBitmaps.length === 0) return;
+        for (const item of this.retiredBitmaps) {
+            this.safelyCloseBitmap(item.bitmap);
+            this.borrowedRetiredBytes -= item.bytes;
+        }
+        this.retiredBitmaps = [];
+        this.borrowedRetiredBytes = Math.max(0, this.borrowedRetiredBytes);
+    }
+
+    getTotalBytes() {
+        return this.currentBytes + this.borrowedRetiredBytes + this.pendingJpegBytes +
+               this.pendingDecodeBytes + this.grantedBytes;
+    }
+
+    getAvailableBytes() {
+        return Math.max(0, this.maxBytes - this.getTotalBytes());
+    }
+
+    reserveCredit(key, compressedBytes, rasterBytes) {
+        const needed = compressedBytes + rasterBytes;
+        if (this.insufficientCapacity) return false;
+        while (this.getTotalBytes() + needed > this.maxBytes) {
+            if (!this.sieveEvictOneVictim(null)) return false;
+        }
+        this.grantedBytes += needed;
+        return true;
+    }
+
+    releaseCredit(compressedBytes, rasterBytes) {
+        const total = compressedBytes + rasterBytes;
+        this.grantedBytes = Math.max(0, this.grantedBytes - total);
+    }
+
+    transitionGrantToJpeg(compressedBytes) {
+        this.grantedBytes = Math.max(0, this.grantedBytes - compressedBytes);
+        this.pendingJpegBytes += compressedBytes;
+    }
+
+    transitionGrantToDecode(rasterBytes) {
+        this.grantedBytes = Math.max(0, this.grantedBytes - rasterBytes);
+        this.pendingDecodeBytes += rasterBytes;
+    }
+
+    releaseDecode(compressedBytes, rasterBytes) {
+        if (compressedBytes > 0) {
+            this.pendingJpegBytes = Math.max(0, this.pendingJpegBytes - compressedBytes);
+        }
+        if (rasterBytes > 0) {
+            this.pendingDecodeBytes = Math.max(0, this.pendingDecodeBytes - rasterBytes);
+        }
+    }
+
+    retireGeneration() {
+        for (const [key, node] of this.map.entries()) {
+            this.retireSingleNode(node);
+        }
+        this.clearListState();
+        this.immortalKeys.clear();
+        this.immortalKeys.add('0:0:0');
+        this.visibleKeys.clear();
+        this.grantedBytes = 0;
+    }
+
+    retireSingleNode(node) {
+        if (this.frameBorrows.has(node)) {
+            this.retiredBitmaps.push({ bitmap: node.value, bytes: node.bytes });
+            this.borrowedRetiredBytes += node.bytes;
+        } else {
+            this.safelyCloseBitmap(node.value);
+        }
+    }
+
     markImmortal(key) {
         this.immortalKeys.add(key);
     }
 
-    /**
-     * Updates the set of keys currently visible on the screen.
-     * @param {Set<string>} keySet
-     */
+    unlockLevel() {
+        // Retained for API compatibility; full-level locking removed per Plan Punto 1
+    }
+
+    lockLevel(zoomLevel) {
+        // Retained for API compatibility; full-level locking removed per Plan Punto 1
+    }
+
     updateVisibleKeys(keySet) {
         this.visibleKeys = keySet || new Set();
+        this.markVisibleKeysDemanded();
     }
 
-    /**
-     * Dynamically adjusts cache size based on visible viewport requirements.
-     * @param {number} visibleCount
-     */
     adjustCapacity(visibleCount) {
-        const count = visibleCount || 0;
-        this.maxTiles = Math.max(this.baseCapacity, Math.ceil(count * 6));
+        // Dynamic capacity governed strictly by byte budget and maxEntries
     }
 
     /**
-     * Orchestrator: Stores an ImageBitmap in the cache, evicting the oldest non-protected tile if full.
+     * Orchestrator: Stores an ImageBitmap in cache using safe replacement or SIEVE admission.
      * @param {string} key Tile identifier formatted as "zoom:x:y".
      * @param {ImageBitmap} bitmap Decoded image bitmap.
+     * @param {number} [reservedRasterBytes=0] Pre-reserved raster bytes in pendingDecodeBytes.
+     * @returns {'ADMITTED'|'UPDATED'|'ALREADY_RESIDENT'|'REJECTED_CAPACITY'}
      */
-    set(key, bitmap) {
-        this.handleExistingKey(key);
-        this.enforceCapacityLimit();
-        this.map.set(key, bitmap);
-    }
+    set(key, bitmap, reservedRasterBytes = 0) {
+        if (!bitmap) return 'REJECTED_CAPACITY';
+        const costBytes = this.calculateBitmapBytes(bitmap);
 
-    /**
-     * Orchestrator: Retrieves an ImageBitmap and updates its LRU position.
-     * @param {string} key Tile identifier.
-     * @returns {ImageBitmap|null}
-     */
-    get(key) {
-        if (!this.map.has(key)) {
-            return null;
+        if (this.map.has(key)) {
+            return this.executeSafeReplacement(key, bitmap, costBytes, reservedRasterBytes);
         }
-        const bitmap = this.map.get(key);
-        this.refreshLruPosition(key, bitmap);
-        return bitmap;
+        return this.executeSieveAdmission(key, bitmap, costBytes, reservedRasterBytes);
     }
 
-    /**
-     * Checks if a tile is currently resident in memory.
-     * @param {string} key
-     * @returns {boolean}
-     */
+    admitDecoded(key, bitmap, rasterCost, compressedCost) {
+        const status = this.set(key, bitmap, rasterCost);
+        if (compressedCost > 0) {
+            this.pendingJpegBytes = Math.max(0, this.pendingJpegBytes - compressedCost);
+        }
+        return status;
+    }
+
+    get(key, isDemand = false) {
+        const node = this.map.get(key);
+        if (!node) return null;
+
+        if (isDemand) {
+            node.visited = true;
+            this.demandHits++;
+        } else {
+            this.renderHits++;
+        }
+        return node.value;
+    }
+
+    peek(key) {
+        const node = this.map.get(key);
+        if (node) this.renderHits++;
+        return node ? node.value : null;
+    }
+
+    recordDemand(key) {
+        const node = this.map.get(key);
+        if (node) {
+            node.visited = true;
+            this.demandHits++;
+        }
+    }
+
     has(key) {
         return this.map.has(key);
     }
 
-    /**
-     * Closes and frees all resident ImageBitmaps (except immortals).
-     */
     evictAll() {
-        for (const [key, bitmap] of this.map.entries()) {
+        for (const [key, node] of this.map.entries()) {
             if (!this.immortalKeys.has(key)) {
-                this.safelyCloseBitmap(bitmap);
+                this.safelyCloseBitmap(node.value);
             }
         }
         const saved = new Map();
         for (const k of this.immortalKeys) {
             if (this.map.has(k)) {
-                saved.set(k, this.map.get(k));
+                const node = this.map.get(k);
+                saved.set(k, { bitmap: node.value, bytes: node.bytes });
             }
         }
-        this.map.clear();
+        this.clearListState();
         for (const [k, v] of saved) {
-            this.map.set(k, v);
+            this.insertNewSieveNode(k, v.bitmap, v.bytes);
         }
     }
 
-    /**
-     * Returns cache diagnostic metrics.
-     */
     getStats() {
         return {
+            algorithm: 'SIEVE (NSDI 2024)',
             size: this.map.size,
-            maxSize: this.maxTiles,
-            evictions: this.evictionCount
+            maxEntries: this.maxEntries,
+            currentBytes: this.currentBytes,
+            totalBytes: this.getTotalBytes(),
+            borrowedRetiredBytes: this.borrowedRetiredBytes,
+            pendingJpegBytes: this.pendingJpegBytes,
+            pendingDecodeBytes: this.pendingDecodeBytes,
+            grantedBytes: this.grantedBytes,
+            maxBytes: this.maxBytes,
+            evictions: this.evictionCount,
+            demandHits: this.demandHits,
+            renderHits: this.renderHits,
+            rejections: this.rejections,
+            insufficientCapacity: this.insufficientCapacity
         };
     }
 
     // --- Sub-functions (Single-responsibility) ---
 
-    enforceCapacityLimit() {
-        while (this.map.size >= this.maxTiles) {
-            const evicted = this.evictOldestNonProtectedTile();
-            if (!evicted) {
-                break; // All cached tiles are visible or immortal
+    calculateBitmapBytes(bitmap) {
+        const w = bitmap.width || 256;
+        const h = bitmap.height || 256;
+        return w * h * 4;
+    }
+
+    executeSafeReplacement(key, newBitmap, newBytes, reservedRasterBytes = 0) {
+        const existingNode = this.map.get(key);
+        if (existingNode.value === newBitmap) {
+            return 'ALREADY_RESIDENT';
+        }
+
+        if (reservedRasterBytes === 0 && !this.makeRoomForBytes(newBytes, key)) {
+            this.safelyCloseBitmap(newBitmap);
+            this.rejections++;
+            return 'REJECTED_CAPACITY';
+        }
+
+        this.applyReplacement(existingNode, newBitmap, newBytes, reservedRasterBytes);
+        return 'UPDATED';
+    }
+
+    applyReplacement(existingNode, newBitmap, newBytes, reservedRasterBytes) {
+        if (reservedRasterBytes > 0) {
+            this.pendingDecodeBytes = Math.max(0, this.pendingDecodeBytes - reservedRasterBytes);
+        }
+        const oldBitmap = existingNode.value;
+        const oldBytes = existingNode.bytes;
+        existingNode.value = newBitmap;
+        existingNode.bytes = newBytes;
+        existingNode.visited = false;
+        this.currentBytes += (newBytes - oldBytes);
+        this.retireReplacedBitmap(existingNode, oldBitmap, oldBytes);
+    }
+
+    retireReplacedBitmap(existingNode, oldBitmap, oldBytes) {
+        if (this.frameBorrows.has(existingNode)) {
+            this.retiredBitmaps.push({ bitmap: oldBitmap, bytes: oldBytes });
+            this.borrowedRetiredBytes += oldBytes;
+        } else {
+            this.safelyCloseBitmap(oldBitmap);
+        }
+    }
+
+    executeSieveAdmission(key, bitmap, bytes, reservedRasterBytes = 0) {
+        if (reservedRasterBytes === 0 && !this.makeRoomForNewEntry(bytes)) {
+            this.safelyCloseBitmap(bitmap);
+            this.rejections++;
+            return 'REJECTED_CAPACITY';
+        }
+        if (reservedRasterBytes > 0) {
+            this.pendingDecodeBytes = Math.max(0, this.pendingDecodeBytes - reservedRasterBytes);
+        }
+        this.insertNewSieveNode(key, bitmap, bytes);
+        return 'ADMITTED';
+    }
+
+    makeRoomForBytes(neededBytes, excludedKey) {
+        if (this.insufficientCapacity) return false;
+        while (this.getTotalBytes() + neededBytes > this.maxBytes) {
+            const evicted = this.sieveEvictOneVictim(excludedKey);
+            if (!evicted) return false;
+        }
+        return true;
+    }
+
+    makeRoomForNewEntry(neededBytes) {
+        if (this.insufficientCapacity) return false;
+        while ((this.getTotalBytes() + neededBytes > this.maxBytes) || (this.map.size + 1 > this.maxEntries)) {
+            const evicted = this.sieveEvictOneVictim(null);
+            if (!evicted) return false;
+        }
+        return true;
+    }
+
+    insertNewSieveNode(key, bitmap, bytes) {
+        const node = new SieveNode(key, bitmap, bytes);
+        this.addToHead(node);
+        this.map.set(key, node);
+        this.currentBytes += bytes;
+
+        if (this.hand === null) {
+            this.hand = node;
+        }
+    }
+
+    sieveEvictOneVictim(excludedKey) {
+        if (this.map.size === 0) return false;
+
+        let obj = this.hand || this.tail;
+        let visitedLoops = 0;
+        const maxLoops = this.map.size * 2;
+
+        while (obj && visitedLoops < maxLoops) {
+            visitedLoops++;
+
+            if (obj.key === excludedKey || this.isKeyProtected(obj.key)) {
+                obj = obj.prev || this.tail;
+                continue;
             }
-        }
-    }
 
-    isKeyProtected(key) {
-        if (this.immortalKeys.has(key) || this.visibleKeys.has(key)) {
-            return true;
-        }
-        const colonIndex = key.indexOf(':');
-        if (colonIndex > 0) {
-            const z = parseInt(key.substring(0, colonIndex), 10);
-            if (!isNaN(z) && z <= 3) {
-                return true;
-            }
-        }
-        return this.isLevelLocked(key);
-    }
-
-    isLevelLocked(key) {
-        if (this.lockedLevel < 0) return false;
-        return key.startsWith(`${this.lockedLevel}:`);
-    }
-
-    evictOldestNonProtectedTile() {
-        for (const [key, bitmap] of this.map.entries()) {
-            if (!this.isKeyProtected(key)) {
-                this.safelyCloseBitmap(bitmap);
-                this.map.delete(key);
-                this.evictionCount++;
-                return true;
+            if (obj.visited) {
+                obj.visited = false;
+                obj = obj.prev || this.tail;
+            } else {
+                return this.discardSieveVictim(obj);
             }
         }
         return false;
     }
 
-    handleExistingKey(key) {
-        if (this.map.has(key)) {
-            const oldBitmap = this.map.get(key);
-            if (!this.immortalKeys.has(key)) {
-                this.safelyCloseBitmap(oldBitmap);
-            }
-            this.map.delete(key);
+    discardSieveVictim(victim) {
+        this.hand = victim.prev || this.tail;
+        this.unlinkNode(victim);
+        this.map.delete(victim.key);
+        this.currentBytes -= victim.bytes;
+        if (this.frameBorrows.has(victim)) {
+            this.retiredBitmaps.push({ bitmap: victim.value, bytes: victim.bytes });
+            this.borrowedRetiredBytes += victim.bytes;
+        } else {
+            this.safelyCloseBitmap(victim.value);
+        }
+        this.evictionCount++;
+        if (typeof this.onEvict === 'function') {
+            this.onEvict(victim.key);
+        }
+        return true;
+    }
+
+    isKeyProtected(key) {
+        return this.immortalKeys.has(key) || this.visibleKeys.has(key);
+    }
+
+    markVisibleKeysDemanded() {
+        for (const k of this.visibleKeys) {
+            const node = this.map.get(k);
+            if (node) node.visited = true;
         }
     }
 
-    refreshLruPosition(key, bitmap) {
-        this.map.delete(key);
-        this.map.set(key, bitmap);
+    addToHead(node) {
+        node.next = this.head;
+        node.prev = null;
+        if (this.head !== null) {
+            this.head.prev = node;
+        }
+        this.head = node;
+        if (this.tail === null) {
+            this.tail = node;
+        }
+    }
+
+    unlinkNode(node) {
+        if (node.prev !== null) {
+            node.prev.next = node.next;
+        } else {
+            this.head = node.next;
+        }
+
+        if (node.next !== null) {
+            node.next.prev = node.prev;
+        } else {
+            this.tail = node.prev;
+        }
+
+        if (this.hand === node) {
+            this.hand = node.prev || this.tail;
+        }
+
+        node.prev = null;
+        node.next = null;
+    }
+
+    clearListState() {
+        this.map.clear();
+        this.head = null;
+        this.tail = null;
+        this.hand = null;
+        this.currentBytes = 0;
     }
 
     safelyCloseBitmap(bitmap) {
