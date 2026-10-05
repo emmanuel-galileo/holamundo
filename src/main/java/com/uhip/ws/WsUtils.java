@@ -35,4 +35,17 @@ public final class WsUtils {
         conn.setAttachment(generated);
         return generated;
     }
+
+    public static String extractParam(WebSocket conn, String paramName) {
+        if (conn == null || paramName == null) return "";
+        String descriptor = conn.getResourceDescriptor();
+        String prefix = paramName + "=";
+        if (descriptor != null && descriptor.contains(prefix)) {
+            int idx = descriptor.indexOf(prefix) + prefix.length();
+            int amp = descriptor.indexOf('&', idx);
+            String val = (amp != -1) ? descriptor.substring(idx, amp) : descriptor.substring(idx);
+            return val.trim();
+        }
+        return "";
+    }
 }

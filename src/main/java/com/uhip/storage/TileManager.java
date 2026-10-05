@@ -2,26 +2,37 @@ package com.uhip.storage;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.lang.ref.SoftReference;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * Manages tile storage, disk retrieval, memory caching via SoftReferences,
- * and dynamic generation of placeholder tiles when disk tiles are missing.
+ * Manages tile storage, disk retrieval, bounded memory caching via S3-FIFO (SOSP 2023),
+ * and single-flight coalescing to prevent duplicate concurrent disk reads.
  */
 public final class TileManager {
 
     private final Path baseTilesDir;
     private final int tileSize;
-    private final ConcurrentMap<String, SoftReference<byte[]>> memoryCache;
+    private final S3FifoCache s3Cache;
+    private final ConcurrentMap<String, CompletableFuture<byte[]>> inFlightReads;
+    private final String datasetId = java.util.UUID.randomUUID().toString();
+
+    public String getDatasetId() {
+        return datasetId;
+    }
 
     public TileManager(Path baseTilesDir, int tileSize) {
+        this(baseTilesDir, tileSize, S3FifoCache.DEFAULT_MAX_BYTES);
+    }
+
+    public TileManager(Path baseTilesDir, int tileSize, long maxCacheBytes) {
         this.baseTilesDir = baseTilesDir;
         this.tileSize = tileSize;
-        this.memoryCache = new ConcurrentHashMap<>();
+        this.s3Cache = new S3FifoCache(maxCacheBytes, S3FifoCache.DEFAULT_MAX_GHOST_ENTRIES);
+        this.inFlightReads = new ConcurrentHashMap<>();
     }
 
     public record ImageDimensions(
@@ -32,23 +43,35 @@ public final class TileManager {
     ) {}
 
     private volatile ImageDimensions cachedDimensions;
+    private volatile com.uhip.pyramid.PyramidGeometry geometry;
+
+    public com.uhip.pyramid.PyramidGeometry getGeometry() {
+        if (geometry == null) {
+            ImageDimensions dims = detectImageDimensions();
+            this.geometry = new com.uhip.pyramid.PyramidGeometry(
+                    dims.originalWidth(), dims.originalHeight(), dims.tileSize(), dims.maxZoom()
+            );
+        }
+        return geometry;
+    }
 
     /**
-     * Orchestrator: Retrieves tile JPEG bytes from memory cache or disk.
+     * Orchestrator: Retrieves tile JPEG bytes from S3-FIFO cache or disk.
+     * Coalesces concurrent misses so disk read is executed only once per tile.
      * Returns null if the tile does not physically exist.
      */
     public byte[] getTile(int zoom, int tileX, int tileY) {
         String cacheKey = formatKey(zoom, tileX, tileY);
-        byte[] cached = getFromCache(cacheKey);
+        byte[] cached = s3Cache.get(cacheKey);
         if (cached != null) {
             return cached;
         }
 
-        byte[] tileData = loadFromDisk(zoom, tileX, tileY);
-        if (tileData != null) {
-            putInCache(cacheKey, tileData);
-        }
-        return tileData;
+        return loadTileSingleFlight(cacheKey, zoom, tileX, tileY);
+    }
+
+    public S3FifoCache.CacheStats getCacheStats() {
+        return s3Cache.getStats();
     }
 
     /**
@@ -204,12 +227,19 @@ public final class TileManager {
         return zoom + "/" + tileX + "_" + tileY;
     }
 
-    private byte[] getFromCache(String key) {
-        SoftReference<byte[]> ref = memoryCache.get(key);
-        return (ref != null) ? ref.get() : null;
-    }
+    private byte[] loadTileSingleFlight(String cacheKey, int zoom, int tileX, int tileY) {
+        CompletableFuture<byte[]> future = inFlightReads.computeIfAbsent(cacheKey, k -> CompletableFuture.supplyAsync(() -> {
+            byte[] tileData = loadFromDisk(zoom, tileX, tileY);
+            if (tileData != null) {
+                s3Cache.put(k, tileData);
+            }
+            return tileData;
+        }));
 
-    private void putInCache(String key, byte[] data) {
-        memoryCache.put(key, new SoftReference<>(data));
+        try {
+            return future.join();
+        } finally {
+            inFlightReads.remove(cacheKey, future);
+        }
     }
 }

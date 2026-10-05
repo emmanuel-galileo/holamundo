@@ -23,25 +23,33 @@ public final class DataWebSocket extends WebSocketServer {
     }
 
     @Override
-    public void onStart() {
-        // Ready to stream binary tile frames
-    }
+    public void onStart() {}
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
         String clientId = WsUtils.extractClientId(conn);
-        ClientSession session = sessionManager.getOrCreateSession(clientId);
+        String genId = WsUtils.extractParam(conn, "generationId");
+        ClientSession session = sessionManager.getSession(clientId);
+        if (session == null || !isValidGeneration(session, genId)) {
+            conn.close(1008, "Stale or invalid generation");
+            return;
+        }
         session.setDataConnection(conn);
         System.out.printf("[UHIP] Conexión Datos activa: %s (Total clientes: %d)\n", clientId, sessionManager.getActiveSessionCount());
-        session.triggerDispatch();
+        session.sendDataReady();
+    }
+
+    private boolean isValidGeneration(ClientSession session, String genId) {
+        if (genId == null || genId.isEmpty()) return true;
+        return session.getSessionGenerationId().equals(genId);
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
         String clientId = WsUtils.extractClientId(conn);
         ClientSession session = sessionManager.getSession(clientId);
-        if (session != null && session.getDataConnection() == conn) {
-            session.setDataConnection(null);
+        if (session != null) {
+            session.close();
         }
         sessionManager.checkAndCleanupSession(clientId);
     }
@@ -52,19 +60,14 @@ public final class DataWebSocket extends WebSocketServer {
             String clientId = WsUtils.extractClientId(conn);
             ClientSession session = sessionManager.getSession(clientId);
             if (session != null) {
-                session.getTrafficEngine().onCongestion();
-                session.broadcastTelemetry();
+                session.handleSessionError("Data WebSocket error", ex);
             }
         }
     }
 
     @Override
-    public void onMessage(WebSocket conn, String message) {
-        // Data channel strictly carries binary frames; ignore text frames
-    }
+    public void onMessage(WebSocket conn, String message) {}
 
     @Override
-    public void onMessage(WebSocket conn, ByteBuffer message) {
-        // Optional reverse binary messaging if needed
-    }
+    public void onMessage(WebSocket conn, ByteBuffer message) {}
 }

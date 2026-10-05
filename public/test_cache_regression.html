@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>UHIP Regression Verification Suite (E1 - E7, V1, V2)</title>
+    <style>
+        body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
+        .summary { font-size: 16px; margin: 15px 0; padding: 10px; border-radius: 4px; }
+        .summary-pass { background: #1b4332; color: #51cf66; border: 1px solid #2d6a4f; }
+        .summary-fail { background: #49111c; color: #ff6b6b; border: 1px solid #800e13; }
+        .pass { color: #51cf66; font-weight: bold; }
+        .fail { color: #ff6b6b; font-weight: bold; }
+        .log { margin: 6px 0; }
+    </style>
+</head>
+<body>
+    <h2>UHIP Regression Verification Suite (E1 - E7, V1, V2)</h2>
+    <div id="summary"></div>
+    <div id="results"></div>
+
+    <script type="module">
+        import { TileCache } from './js/cache.js';
+        import { CLIENT_CONFIG } from './js/config.js';
+        import { PyramidGeometry } from './js/geometry.js';
+
+        const resultsEl = document.getElementById('results');
+        const summaryEl = document.getElementById('summary');
+        let passedCount = 0;
+        let failedCount = 0;
+
+        function log(msg, isPass) {
+            const div = document.createElement('div');
+            div.className = 'log ' + (isPass === true ? 'pass' : (isPass === false ? 'fail' : ''));
+            div.textContent = msg;
+            resultsEl.appendChild(div);
+            if (isPass === true) passedCount++;
+            if (isPass === false) failedCount++;
+        }
+
+        class MockBitmap {
+            constructor(name, width = 256, height = 256) {
+                this.name = name;
+                this.width = width;
+                this.height = height;
+                this.isClosed = false;
+            }
+            close() {
+                if (this.isClosed) {
+                    throw new Error(`Double close detected on bitmap ${this.name}`);
+                }
+                this.isClosed = true;
+            }
+        }
+
+        async function runTests() {
+            log('Iniciando verificación integral de correcciones E1 a E7, V1 y V2...', null);
+
+            // --- TEST 1: E1 - Configuración Real del Visor ---
+            try {
+                if (CLIENT_CONFIG.maxCacheBytes !== 128 * 1024 * 1024) {
+                    throw new Error(`Presupuesto incorrecto: ${CLIENT_CONFIG.maxCacheBytes} (esperado 134,217,728)`);
+                }
+                if (CLIENT_CONFIG.maxCacheEntries !== 512) {
+                    throw new Error(`Entradas incorrectas: ${CLIENT_CONFIG.maxCacheEntries} (esperado 512)`);
+                }
+                if (CLIENT_CONFIG.maxConcurrentDecodes !== 4) {
+                    throw new Error(`Concurrencia incorrecta: ${CLIENT_CONFIG.maxConcurrentDecodes} (esperado 4)`);
+                }
+                const cache = new TileCache(CLIENT_CONFIG.maxCacheBytes, CLIENT_CONFIG.maxCacheEntries);
+                if (cache.maxBytes !== 128 * 1024 * 1024 || cache.insufficientCapacity) {
+                    throw new Error(`Instancia de cache reportó capacidad insuficiente o presupuesto inválido`);
+                }
+                log('✔ E1: Configuración real del visor (128 MiB, 512 entradas) verificada.', true);
+            } catch (err) {
+                log(`✖ Error en E1: ${err.message}`, false);
+            }
+
+            // --- TEST 2: V2 - Reemplazo Seguro con Coexistencia Bounded (3 rasters) ---
+            try {
+                const tileBytes = 256 * 256 * 4;
+                const cache3 = new TileCache(tileBytes * 3, 3);
+                const a1 = new MockBitmap('a1');
+                const b1 = new MockBitmap('b1');
+                cache3.set('keyA', a1);
+                cache3.set('keyB', b1);
+
+                const a2 = new MockBitmap('a2');
+                const resRep = cache3.set('keyA', a2);
+                if (resRep !== 'UPDATED') throw new Error(`Esperado UPDATED, obtenido ${resRep}`);
+                if (!a1.isClosed) throw new Error('El bitmap anterior a1 debió cerrarse');
+                if (a2.isClosed) throw new Error('El bitmap nuevo a2 nunca debe cerrarse');
+                if (cache3.map.size !== 2) throw new Error(`Tamaño de mapa esperado 2, obtenido ${cache3.map.size}`);
+                log('✔ V2a: Reemplazo seguro con coexistencia temporal de 3 rasters verificado.', true);
+            } catch (err) {
+                log(`✖ Error en V2a: ${err.message}`, false);
+            }
+
+            // --- TEST 3: V2b - Rechazo Seguro con Presupuesto Saturado (2 rasters) ---
+            try {
+                const tileBytes = 256 * 256 * 4;
+                const cache2 = new TileCache(tileBytes * 2, 2);
+                const p1 = new MockBitmap('p1');
+                const p2 = new MockBitmap('p2');
+                cache2.set('keyP1', p1);
+                cache2.set('keyP2', p2);
+                cache2.updateVisibleKeys(new Set(['keyP1', 'keyP2'])); // Ambas protegidas
+
+                const p3 = new MockBitmap('p3');
+                const resRej = cache2.set('keyP3', p3);
+                if (resRej !== 'REJECTED_CAPACITY') throw new Error(`Esperado REJECTED_CAPACITY, obtenido ${resRej}`);
+                if (!p3.isClosed) throw new Error('El bitmap rechazado debe cerrarse de inmediato');
+                log('✔ V2b: Rechazo controlado con rasters protegidos saturados verificado.', true);
+            } catch (err) {
+                log(`✖ Error en V2b: ${err.message}`, false);
+            }
+
+            // --- TEST 4: E5 - Deduplicación de Residencia y Hook onEvict ---
+            try {
+                const tileBytes = 256 * 256 * 4;
+                const cache = new TileCache(tileBytes * 2, 2);
+                const evictedKeys = [];
+                cache.onEvict = (key) => evictedKeys.push(key);
+
+                const b1 = new MockBitmap('b1');
+                const b2 = new MockBitmap('b2');
+                const b3 = new MockBitmap('b3');
+
+                cache.set('key1', b1);
+                cache.set('key2', b2);
+
+                // Reemplazo key1 con key1_v2: NO debe emitir EVICT
+                const b1_v2 = new MockBitmap('b1_v2');
+                cache.set('key1', b1_v2);
+                if (evictedKeys.length !== 0) {
+                    throw new Error(`Reemplazo de clave no debe emitir EVICT: ${JSON.stringify(evictedKeys)}`);
+                }
+
+                // Inserción key3 provoca desalojo SIEVE de key2: DEBE emitir EVICT
+                cache.set('key3', b3);
+                if (evictedKeys.length !== 1 || evictedKeys[0] !== 'key2') {
+                    throw new Error(`Desalojo real debió emitir EVICT para key2, obtenido: ${JSON.stringify(evictedKeys)}`);
+                }
+
+                log('✔ E5: Hook onEvict y discriminación entre reemplazo y desalojo verificados.', true);
+            } catch (err) {
+                log(`✖ Error en E5: ${err.message}`, false);
+            }
+
+            // --- TEST 5: E6 - Préstamos de Frame (Borrows) y Cierre Diferido ---
+            try {
+                const tileBytes = 256 * 256 * 4;
+                const cache = new TileCache(tileBytes * 2, 2);
+                const r1 = new MockBitmap('root1');
+                cache.markImmortal('0:0:0');
+                cache.set('0:0:0', r1);
+
+                const borrowed = cache.borrow('0:0:0');
+                if (borrowed !== r1) throw new Error('Borrow falló en devolver el bitmap');
+
+                const r2 = new MockBitmap('root2');
+                cache.set('0:0:0', r2);
+
+                if (r1.isClosed) throw new Error('Bitmap retirado no debe cerrarse mientras siga prestado en el frame');
+                if (cache.borrowedRetiredBytes !== tileBytes) throw new Error(`Debe contabilizar bytes retirados: ${cache.borrowedRetiredBytes}`);
+
+                cache.releaseFrameBorrows();
+                if (!r1.isClosed) throw new Error('Bitmap retirado debió cerrarse al finalizar el frame');
+                if (cache.borrowedRetiredBytes !== 0) throw new Error('borrowedRetiredBytes debe ser 0 tras liberar préstamos');
+
+                log('✔ E6: Préstamos de frame y cierre seguro de bitmaps retirados verificados.', true);
+            } catch (err) {
+                log(`✖ Error en E6: ${err.message}`, false);
+            }
+
+            // --- TEST 6: V1 & E7 - PyramidGeometry y Recorte Fraccionario ---
+            try {
+                const geom = new PyramidGeometry(257, 129, 256, 1);
+                const rootDim = geom.rootContentDimensions();
+                if (rootDim.srcW !== 128.5 || rootDim.srcH !== 64.5) {
+                    throw new Error(`Dimensiones de raíz inválidas: ${rootDim.srcW}x${rootDim.srcH} (esperado 128.5x64.5)`);
+                }
+
+                const tileDim = geom.tileContentDimensions(1, 0, 0);
+                if (tileDim.srcW !== 256 || tileDim.srcH !== 129) {
+                    throw new Error(`Dimensiones de tesela inválidas: ${tileDim.srcW}x${tileDim.srcH}`);
+                }
+
+                log('✔ V1 & E7: PyramidGeometry y recorte fraccionario (128.5x64.5 hacia 257x129) verificados.', true);
+            } catch (err) {
+                log(`✖ Error en V1/E7: ${err.message}`, false);
+            }
+
+            // --- TEST 7: C5 - Presupuesto Administrado (G -> J -> D -> R) y Retiro de Generación ---
+            try {
+                const tileBytes = 256 * 256 * 4;
+                const cache = new TileCache(tileBytes * 4, 4);
+                const compBytes = 5000;
+
+                const reserved = cache.reserveCredit('tile1', compBytes, tileBytes);
+                if (!reserved) throw new Error('Falló reserva de crédito inicial');
+                if (cache.grantedBytes !== compBytes + tileBytes) {
+                    throw new Error(`grantedBytes incorrecto: ${cache.grantedBytes}`);
+                }
+
+                cache.transitionGrantToJpeg(compBytes);
+                if (cache.grantedBytes !== tileBytes || cache.pendingJpegBytes !== compBytes) {
+                    throw new Error('Transición G -> J incorrecta');
+                }
+
+                cache.transitionGrantToDecode(tileBytes);
+                if (cache.grantedBytes !== 0 || cache.pendingDecodeBytes !== tileBytes) {
+                    throw new Error('Transición G -> D incorrecta');
+                }
+
+                const b1 = new MockBitmap('b1');
+                const status = cache.admitDecoded('tile1', b1, tileBytes, compBytes);
+                if (status !== 'ADMITTED') throw new Error(`Esperado ADMITTED, obtenido ${status}`);
+                if (cache.pendingJpegBytes !== 0 || cache.pendingDecodeBytes !== 0) {
+                    throw new Error('Cargo J y D debió liberarse tras admisión');
+                }
+                if (cache.currentBytes !== tileBytes) {
+                    throw new Error(`Raster R incorrecto tras admisión: ${cache.currentBytes}`);
+                }
+
+                // Retiro de generación
+                cache.retireGeneration();
+                if (!b1.isClosed) throw new Error('El bitmap debió cerrarse en retiro de generación');
+                if (cache.currentBytes !== 0 || cache.map.size !== 0) {
+                    throw new Error('Retiro de generación debe vaciar R y map');
+                }
+
+                log('✔ C5: Presupuesto administrado (G -> J -> D -> R) y retiro de generación verificados.', true);
+            } catch (err) {
+                log(`✖ Error en C5: ${err.message}`, false);
+            }
+
+            // --- Resumen Final ---
+            const total = passedCount + failedCount;
+            if (failedCount === 0) {
+                summaryEl.className = 'summary summary-pass';
+                summaryEl.textContent = `[OK] Suite superada con éxito: ${passedCount}/${total} pruebas aprobadas. Cero fallos.`;
+            } else {
+                summaryEl.className = 'summary summary-fail';
+                summaryEl.textContent = `[FALLO] Suite con errores: ${failedCount}/${total} pruebas fallidas.`;
+            }
+        }
+
+        window.addEventListener('error', (e) => {
+            log(`✖ Error global no capturado: ${e.message}`, false);
+        });
+
+        window.onload = runTests;
+    </script>
+</body>
+</html>

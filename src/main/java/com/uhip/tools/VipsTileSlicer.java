@@ -61,8 +61,14 @@ public final class VipsTileSlicer {
         }
         Path vipsExe = findEmbeddedVips();
         if (vipsExe == null) {
-            System.err.println("[ERROR] No se localizó 'vips.exe' en la carpeta 'vips-dev-8.18/bin/' ni en el sistema.");
-            return false;
+            System.out.println("[UHIP] Motor VIPS no detectado. Utilizando reductor nativo Java Burt-Adelson REDUCE (Burt & Adelson, 1983)...");
+            try {
+                TileCutter.main(new String[]{imagePath.toString(), outDir.toString()});
+                return true;
+            } catch (Exception e) {
+                System.err.println("[ERROR] Falló la reducción Burt-Adelson en Java: " + e.getMessage());
+                return false;
+            }
         }
 
         ImageInfo info = probeDimensions(imagePath, vipsExe);

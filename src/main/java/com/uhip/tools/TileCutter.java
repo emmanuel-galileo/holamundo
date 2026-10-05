@@ -1,5 +1,6 @@
 package com.uhip.tools;
 
+import com.uhip.pyramid.BurtAdelsonReducer;
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageWriteParam;
@@ -65,12 +66,23 @@ public final class TileCutter {
         }
         int maxZoom = calculateMaxZoom(source.getWidth(), source.getHeight());
         System.out.printf("Source dimensions: %dx%d -> Calculated MaxZoom: %d\n", source.getWidth(), source.getHeight(), maxZoom);
+        System.out.println("[Burt-Adelson] Generating Gaussian pyramid levels using 5-tap separable REDUCE filter [1,5,8,5,1]/20...");
         Files.createDirectories(outDir);
 
+        BufferedImage[] pyramid = buildBurtAdelsonPyramid(source, maxZoom);
         for (int z = 0; z <= maxZoom; z++) {
-            sliceLevelFromImage(source, z, outDir);
+            sliceLevelTiles(pyramid[z], z, outDir);
         }
         writeMetadataJson(outDir, source.getWidth(), source.getHeight(), maxZoom);
+    }
+
+    private static BufferedImage[] buildBurtAdelsonPyramid(BufferedImage source, int maxZoom) {
+        BufferedImage[] pyramid = new BufferedImage[maxZoom + 1];
+        pyramid[maxZoom] = source;
+        for (int z = maxZoom - 1; z >= 0; z--) {
+            pyramid[z] = BurtAdelsonReducer.reduce(pyramid[z + 1]);
+        }
+        return pyramid;
     }
 
     private static void writeMetadataJson(Path outDir, int width, int height, int maxZoom) {
@@ -172,25 +184,23 @@ public final class TileCutter {
         g2d.drawLine(118, 128, 138, 128);
     }
 
-    private static void sliceLevelFromImage(BufferedImage source, int zoom, Path outDir) throws IOException {
-        int gridDim = 1 << zoom;
-        int levelWidth = gridDim * TILE_SIZE;
-        int levelHeight = gridDim * TILE_SIZE;
+    private static void sliceLevelTiles(BufferedImage levelImage, int zoom, Path outDir) throws IOException {
         Path zoomDir = outDir.resolve(String.valueOf(zoom));
         Files.createDirectories(zoomDir);
 
-        BufferedImage scaledLevel = new BufferedImage(levelWidth, levelHeight, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g2d = scaledLevel.createGraphics();
-        try {
-            g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g2d.drawImage(source, 0, 0, levelWidth, levelHeight, null);
-        } finally {
-            g2d.dispose();
-        }
+        int imgW = levelImage.getWidth();
+        int imgH = levelImage.getHeight();
+        int tilesX = (imgW + TILE_SIZE - 1) / TILE_SIZE;
+        int tilesY = (imgH + TILE_SIZE - 1) / TILE_SIZE;
 
-        for (int y = 0; y < gridDim; y++) {
-            for (int x = 0; x < gridDim; x++) {
-                BufferedImage tile = scaledLevel.getSubimage(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+        for (int y = 0; y < tilesY; y++) {
+            for (int x = 0; x < tilesX; x++) {
+                int tileX = x * TILE_SIZE;
+                int tileY = y * TILE_SIZE;
+                int tileW = Math.min(TILE_SIZE, imgW - tileX);
+                int tileH = Math.min(TILE_SIZE, imgH - tileY);
+
+                BufferedImage tile = levelImage.getSubimage(tileX, tileY, tileW, tileH);
                 writeJpegTile(tile, zoomDir.resolve(x + "_" + y + ".jpg"));
             }
         }
