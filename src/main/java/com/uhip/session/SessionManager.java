@@ -1,6 +1,7 @@
 package com.uhip.session;
 
 import com.uhip.storage.TileManager;
+import org.java_websocket.WebSocket;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -27,6 +28,14 @@ public final class SessionManager {
      */
     public ClientSession getOrCreateSession(String clientId) {
         return sessions.computeIfAbsent(clientId, id -> createNewSession(id));
+    }
+
+    public ClientSession openControlSession(String clientId, WebSocket connection) {
+        ClientSession fresh = createNewSession(clientId);
+        fresh.setControlConnection(connection);
+        ClientSession previous = sessions.put(clientId, fresh);
+        if (previous != null) previous.executeSerial(previous::close);
+        return fresh;
     }
 
     /**
@@ -59,6 +68,10 @@ public final class SessionManager {
     public void checkAndCleanupSession(String clientId) {
         ClientSession session = sessions.get(clientId);
         if (session != null) {
+            if (session.getState() == ClientSession.SessionState.CLOSED) {
+                sessions.remove(clientId, session);
+                return;
+            }
             boolean controlClosed = (session.getControlConnection() == null || session.getControlConnection().isClosed());
             boolean dataClosed = (session.getDataConnection() == null || session.getDataConnection().isClosed());
             if (controlClosed && dataClosed) {
@@ -71,13 +84,17 @@ public final class SessionManager {
      * Shuts down the background executor.
      */
     public void shutdown() {
-        virtualThreadExecutor.shutdown();
+        sessions.values().forEach(ClientSession::close);
+        sessions.clear();
+        virtualThreadExecutor.shutdownNow();
     }
 
     // --- Sub-functions ---
 
     private ClientSession createNewSession(String clientId) {
         System.out.printf("[UHIP] Nueva sesión creada: %s | Clientes registrados: %d\n", clientId, sessions.size() + 1);
-        return new ClientSession(clientId, tileManager, virtualThreadExecutor);
+        ClientSession session = new ClientSession(clientId, tileManager, virtualThreadExecutor);
+        session.setCloseListener(() -> sessions.remove(clientId, session));
+        return session;
     }
 }

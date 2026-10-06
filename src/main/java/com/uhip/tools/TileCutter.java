@@ -1,19 +1,13 @@
 package com.uhip.tools;
 
-import com.uhip.pyramid.BurtAdelsonReducer;
-import javax.imageio.IIOImage;
-import javax.imageio.ImageIO;
-import javax.imageio.ImageWriteParam;
-import javax.imageio.ImageWriter;
-import javax.imageio.stream.FileImageOutputStream;
+import com.uhip.imaging.PyramidJob;
+import com.uhip.imaging.codec.JpegEncoder;
 import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Iterator;
 
 /**
  * CLI tool for slicing large images (PNG/JPEG) into a deep multi-resolution
@@ -22,7 +16,7 @@ import java.util.Iterator;
 public final class TileCutter {
 
     private static final int TILE_SIZE = 256;
-    private static final float JPEG_QUALITY = 0.85f;
+    private static final int JPEG_QUALITY = 85;
 
     private TileCutter() {}
 
@@ -49,6 +43,8 @@ public final class TileCutter {
     // --- High-level Orchestrators ---
 
     private static void generateSyntheticDatasetOrchestrator(int maxZoom, Path outDir) throws IOException {
+        if (maxZoom < 0 || maxZoom > 16) throw new IOException("Zoom sintético fuera de rango: 0..16");
+        if (Files.exists(outDir)) throw new IOException("Use una carpeta nueva para el dataset sintético: " + outDir);
         System.out.printf("Generating synthetic pyramid [Zooms 0 to %d] into %s...\n", maxZoom, outDir);
         Files.createDirectories(outDir);
         for (int z = 0; z <= maxZoom; z++) {
@@ -59,42 +55,15 @@ public final class TileCutter {
     }
 
     private static void sliceSourceImageOrchestrator(Path sourceFile, Path outDir) throws IOException {
-        System.out.println("Loading source image: " + sourceFile);
-        BufferedImage source = ImageIO.read(sourceFile.toFile());
-        if (source == null) {
-            throw new IllegalArgumentException("Unable to decode image from " + sourceFile);
-        }
-        int maxZoom = calculateMaxZoom(source.getWidth(), source.getHeight());
-        System.out.printf("Source dimensions: %dx%d -> Calculated MaxZoom: %d\n", source.getWidth(), source.getHeight(), maxZoom);
-        System.out.println("[Burt-Adelson] Generating Gaussian pyramid levels using 5-tap separable REDUCE filter [1,5,8,5,1]/20...");
-        Files.createDirectories(outDir);
-
-        BufferedImage[] pyramid = buildBurtAdelsonPyramid(source, maxZoom);
-        for (int z = 0; z <= maxZoom; z++) {
-            sliceLevelTiles(pyramid[z], z, outDir);
-        }
-        writeMetadataJson(outDir, source.getWidth(), source.getHeight(), maxZoom);
+        PyramidJob.run(sourceFile, outDir, PyramidJob.Options.defaults());
     }
 
-    private static BufferedImage[] buildBurtAdelsonPyramid(BufferedImage source, int maxZoom) {
-        BufferedImage[] pyramid = new BufferedImage[maxZoom + 1];
-        pyramid[maxZoom] = source;
-        for (int z = maxZoom - 1; z >= 0; z--) {
-            pyramid[z] = BurtAdelsonReducer.reduce(pyramid[z + 1]);
-        }
-        return pyramid;
-    }
-
-    private static void writeMetadataJson(Path outDir, int width, int height, int maxZoom) {
+    private static void writeMetadataJson(Path outDir, int width, int height, int maxZoom) throws IOException {
         String json = String.format(
                 "{\n  \"originalWidth\": %d,\n  \"originalHeight\": %d,\n  \"tileSize\": %d,\n  \"maxZoom\": %d\n}\n",
                 width, height, TILE_SIZE, maxZoom
         );
-        try {
-            Files.writeString(outDir.resolve("metadata.json"), json);
-        } catch (IOException e) {
-            System.err.println("[WARN] No se pudo escribir metadata.json: " + e.getMessage());
-        }
+        Files.writeString(outDir.resolve("metadata.json"), json);
     }
 
     // --- Sub-functions (Single-responsibility) ---
@@ -113,11 +82,6 @@ public final class TileCutter {
 
     private static Path extractOutputDir(String[] args, int index) {
         return (args.length > index) ? Paths.get(args[index]) : Paths.get("tiles");
-    }
-
-    private static int calculateMaxZoom(int width, int height) {
-        int maxDim = Math.max(width, height);
-        return Math.max(0, (int) Math.ceil(Math.log(maxDim / (double) TILE_SIZE) / Math.log(2.0)));
     }
 
     private static void generateZoomLevel(int zoom, Path outDir) throws IOException {
@@ -184,43 +148,9 @@ public final class TileCutter {
         g2d.drawLine(118, 128, 138, 128);
     }
 
-    private static void sliceLevelTiles(BufferedImage levelImage, int zoom, Path outDir) throws IOException {
-        Path zoomDir = outDir.resolve(String.valueOf(zoom));
-        Files.createDirectories(zoomDir);
-
-        int imgW = levelImage.getWidth();
-        int imgH = levelImage.getHeight();
-        int tilesX = (imgW + TILE_SIZE - 1) / TILE_SIZE;
-        int tilesY = (imgH + TILE_SIZE - 1) / TILE_SIZE;
-
-        for (int y = 0; y < tilesY; y++) {
-            for (int x = 0; x < tilesX; x++) {
-                int tileX = x * TILE_SIZE;
-                int tileY = y * TILE_SIZE;
-                int tileW = Math.min(TILE_SIZE, imgW - tileX);
-                int tileH = Math.min(TILE_SIZE, imgH - tileY);
-
-                BufferedImage tile = levelImage.getSubimage(tileX, tileY, tileW, tileH);
-                writeJpegTile(tile, zoomDir.resolve(x + "_" + y + ".jpg"));
-            }
-        }
-    }
-
     private static void writeJpegTile(BufferedImage tile, Path targetPath) throws IOException {
-        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
-        if (!writers.hasNext()) {
-            throw new IllegalStateException("No JPEG ImageWriter found");
-        }
-        ImageWriter writer = writers.next();
-        try (FileImageOutputStream fios = new FileImageOutputStream(targetPath.toFile())) {
-            writer.setOutput(fios);
-            ImageWriteParam param = writer.getDefaultWriteParam();
-            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-            param.setCompressionQuality(JPEG_QUALITY);
-            writer.write(null, new IIOImage(tile, null, null), param);
-        } finally {
-            writer.dispose();
-        }
+        int w = tile.getWidth(), h = tile.getHeight();
+        JpegEncoder.write(targetPath, w, h, tile.getRGB(0, 0, w, h, null, 0, w), JPEG_QUALITY);
     }
 
     private static void printBanner() {

@@ -39,7 +39,7 @@ public class TestUhipClient {
             @Override
             public void onOpen(ServerHandshake handshakedata) {
                 System.out.println("[TEST] Control WebSocket Connected. Sending HELLO...");
-                send("{\"type\":\"HELLO\",\"clientVersion\":\"1.0\",\"maxMemoryBytes\":134217728}");
+                send("{\"type\":\"HELLO\",\"clientVersion\":\"1.0\",\"protocolProfile\":\"BATCH_STREAM_V2\",\"clientId\":\"" + clientId + "\",\"maxMemoryBytes\":134217728}");
             }
 
             @Override

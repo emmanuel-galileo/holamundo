@@ -78,7 +78,7 @@ public class TestMultiClient {
             // 1. Conectar Control WS y enviar HELLO
             WebSocketClient controlWs = new WebSocketClient(new URI("ws://localhost:8081/control?clientId=" + clientId)) {
                 @Override public void onOpen(ServerHandshake h) {
-                    send("{\"type\":\"HELLO\",\"clientVersion\":\"1.0\",\"maxMemoryBytes\":134217728}");
+                    send("{\"type\":\"HELLO\",\"clientVersion\":\"1.0\",\"protocolProfile\":\"BATCH_STREAM_V2\",\"clientId\":\"" + clientId + "\",\"maxMemoryBytes\":134217728}");
                 }
                 @Override public void onMessage(String msg) {
                     if (msg.contains("\"SESSION_READY\"")) {

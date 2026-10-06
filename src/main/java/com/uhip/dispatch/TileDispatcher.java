@@ -18,13 +18,15 @@ public final class TileDispatcher {
     private volatile PyramidGeometry geometry;
     private volatile java.util.function.Predicate<String> exclusionFilter;
     private int currentEpoch;
+    private record Demand(int epoch, int zoom, PyramidGeometry.ClampedBounds bounds, int cx, int cy) { }
+    private Demand demand;
 
     public TileDispatcher() {
         this(null);
     }
 
     public TileDispatcher(PyramidGeometry geometry) {
-        this.queue = new PriorityQueue<>(Comparator.comparingInt(TileTask::priority));
+        this.queue = new PriorityQueue<>(Comparator.comparingInt(TileTask::priority).thenComparingInt(TileTask::zoom).thenComparingInt(TileTask::tileY).thenComparingInt(TileTask::tileX));
         this.enqueuedKeys = new HashSet<>();
         this.geometry = geometry;
         this.currentEpoch = 0;
@@ -57,7 +59,20 @@ public final class TileDispatcher {
         } else {
             reconcileExistingViewportTasks(zoom, bounds, centerX, centerY);
         }
+        demand = new Demand(epoch, zoom, bounds, centerX, centerY);
         fillBoundingBox(epoch, zoom, bounds, centerX, centerY);
+    }
+
+    /** Rebuilds pending demand after eviction/ACK, even after the physical queue was drained. */
+    public synchronized void reconcileDemand() {
+        if (demand != null) fillBoundingBox(demand.epoch(), demand.zoom(), demand.bounds(), demand.cx(), demand.cy());
+    }
+
+    public synchronized void clearDemand() {
+        demand = null;
+        currentEpoch = 0;
+        queue.clear();
+        enqueuedKeys.clear();
     }
 
     public synchronized void reenqueueTasks(List<TileTask> tasks) {
@@ -87,6 +102,7 @@ public final class TileDispatcher {
      */
     public synchronized void cancelEpoch(int targetEpoch) {
         purgeTasksMatchingEpoch(targetEpoch);
+        if (demand != null && demand.epoch() <= targetEpoch) demand = null;
     }
 
     public synchronized int getPendingCount() {
@@ -132,7 +148,7 @@ public final class TileDispatcher {
         while (!queue.isEmpty()) {
             TileTask task = queue.poll();
             if (isTaskInsideBounds(task, zoom, b)) {
-                int newPriority = calculateManhattanDistance(task.tileX(), task.tileY(), cx, cy);
+                int newPriority = task.zoom() == 0 ? 0 : calculateManhattanDistance(task.tileX(), task.tileY(), cx, cy);
                 kept.add(new TileTask(task.epoch(), task.zoom(), task.tileX(), task.tileY(), newPriority));
                 enqueuedKeys.add(task.zoom() + ":" + task.tileX() + ":" + task.tileY());
             }

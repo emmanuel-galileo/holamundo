@@ -8,8 +8,8 @@ import java.util.LinkedHashSet;
  * Implementation of S3-FIFO cache eviction algorithm (Yang et al., SOSP 2023).
  *
  * Employs three bounded FIFO queues:
- * - Small FIFO (S, ~10% of payload memory budget): absorbs transient items.
- * - Main FIFO (M, ~90% of payload memory budget): stores frequently accessed items.
+ * - Small FIFO (S, eviction target ~10% of payload budget): absorbs transient items.
+ * - Main FIFO (M, remainder of payload budget): stores frequently accessed items.
  * - Ghost FIFO (G, history without payload): detects repeat visits of evicted items.
  *
  * Items are admitted with freq=0; hits increment freq up to a saturated threshold of 3.
@@ -52,8 +52,9 @@ public final class S3FifoCache {
     }
 
     public S3FifoCache(long maxBytes, int maxGhostEntries) {
+        validateConfiguration(maxBytes, maxGhostEntries);
         this.maxBytes = maxBytes;
-        this.maxSmallBytes = Math.max(1, (long) (maxBytes * 0.10));
+        this.maxSmallBytes = Math.max(1, maxBytes / 10);
         this.maxGhostEntries = maxGhostEntries;
 
         this.queueS = new LinkedHashMap<>(64, 0.75f, false);
@@ -83,6 +84,7 @@ public final class S3FifoCache {
      * Orchestrator: Stores tile data using S3-FIFO admission and eviction policies.
      */
     public synchronized void put(String key, byte[] data) {
+        if (data.length > maxBytes) return;
         if (isAlreadyResident(key)) {
             updateResidentAccess(key);
             return;
@@ -112,6 +114,11 @@ public final class S3FifoCache {
     }
 
     // --- Sub-functions (Single-responsibility) ---
+
+    private static void validateConfiguration(long maxBytes, int maxGhostEntries) {
+        if (maxBytes <= 0) throw new IllegalArgumentException("Cache byte budget must be positive");
+        if (maxGhostEntries < 0) throw new IllegalArgumentException("Ghost entry budget cannot be negative");
+    }
 
     private S3Entry findEntry(String key) {
         S3Entry entryS = queueS.get(key);
@@ -148,7 +155,7 @@ public final class S3FifoCache {
     }
 
     private void rebalanceAndEvict() {
-        while ((bytesS + bytesM) > maxBytes || bytesS > maxSmallBytes) {
+        while ((bytesS + bytesM) > maxBytes) {
             if (bytesS > maxSmallBytes && !queueS.isEmpty()) {
                 evictFromSmallQueue();
             } else if (!queueM.isEmpty()) {
@@ -198,6 +205,7 @@ public final class S3FifoCache {
     }
 
     private void recordGhostKey(String key) {
+        if (maxGhostEntries == 0) return;
         if (ghostG.size() >= maxGhostEntries) {
             Iterator<String> git = ghostG.iterator();
             if (git.hasNext()) {

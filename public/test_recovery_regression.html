@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="es">
+<meta charset="utf-8">
+<title>UHIP: recuperación y memoria</title>
+<style>body{background:#111;color:#eee;font:16px monospace;padding:24px}.pass{color:#6d6}.fail{color:#f77}</style>
+<h1>UHIP: recuperación y memoria</h1>
+<p id="summary">Ejecutando pruebas locales…</p><ul id="results"></ul>
+<script type="module">
+import { runRecoveryRegressions } from './js/tests/recovery-regression.js';
+window.recoveryResults = await runRecoveryRegressions();
+for (const result of window.recoveryResults) {
+    const item = document.createElement('li');
+    item.className = result.passed ? 'pass' : 'fail';
+    item.textContent = `${result.passed ? 'OK' : 'ERROR'} ${result.name}${result.error ? ': ' + result.error : ''}`;
+    document.getElementById('results').appendChild(item);
+}
+const passed = window.recoveryResults.filter(result => result.passed).length;
+document.getElementById('summary').textContent = `${passed}/${window.recoveryResults.length} pruebas aprobadas`;
+</script>
+</html>

@@ -12,27 +12,38 @@ export { CLIENT_CONFIG };
  * Coordinates EarthCam smooth navigation, immortal base layer bootstrapping,
  * dynamic cache protection, and protocol communication.
  */
-class Application {
+export class Application {
     constructor(config = CLIENT_CONFIG) {
         this.config = config;
         this.canvas = document.getElementById('viewport-canvas');
-        this.cache = new TileCache(this.config.maxCacheBytes, this.config.maxCacheEntries);
-        this.viewport = new Viewport(this.canvas, 256, 8);
-        this.renderer = new CanvasRenderer(this.canvas, this.cache);
-        this.hud = new TelemetryHud();
+        this.initSubsystems();
+        this.initSyncState();
+        this.initProtocol();
+    }
 
+    initSubsystems() {
+        this.cache = new TileCache(this.config.maxCacheBytes, this.config.maxCacheEntries);
+        this.viewport = new Viewport(this.canvas, 256, 8, this.config);
+        this.renderer = new CanvasRenderer(this.canvas, this.cache, 256, this.config);
+        this.hud = new TelemetryHud();
+    }
+
+    initSyncState() {
         this.syncDebounceTimer = null;
         this.lastEpoch = 1;
         this.lastZoom = 0;
         this.baseTileRequested = false;
+        this.lastSentViewSignature = null;
+    }
 
+    initProtocol() {
         this.protocol = new ProtocolClient(this.cache, {
             onConnectionChange: (channel, online) => this.handleConnectionChange(channel, online),
             onDataReady: () => this.handleDataReady(),
             onTelemetry: (msg) => this.handleIncomingTelemetry(msg),
             onTileArrived: (key) => this.handleTileArrived(key),
             isKeyRelevant: (key) => this.isKeyRelevant(key)
-        });
+        }, this.config);
     }
 
     /**
@@ -43,6 +54,7 @@ class Application {
         this.bindWindowEvents();
         this.bindUiControls();
         this.bindViewportSync();
+        this.hud.setInterpolationLabel(this.renderer.interpolationMode);
         this.protocol.connect();
         this.viewport.resetToCover();
         this.scheduleSyncView();
@@ -52,14 +64,14 @@ class Application {
     // --- Sub-functions (Single-responsibility) ---
 
     setupCanvasSize() {
+        const originalCenter = this.viewport?.getOriginalCenter();
         this.canvas.width = window.innerWidth;
         this.canvas.height = window.innerHeight;
         this.canvas.style.width = `${window.innerWidth}px`;
         this.canvas.style.height = `${window.innerHeight}px`;
 
-        if (this.viewport) {
-            this.viewport.handleResize();
-        }
+        if (this.viewport) this.viewport.handleResize(originalCenter);
+        if (this.renderer) this.renderer.onCanvasResized();
     }
 
     bindWindowEvents() {
@@ -96,10 +108,11 @@ class Application {
 
     handleDataReady() {
         this.baseTileRequested = false;
+        this.lastSentViewSignature = null;
         if (!this.cache.has('0:0:0')) {
             this.requestImmortalBaseTile();
         }
-        this.dispatchSyncViewOrchestrator();
+        this.dispatchSyncViewOrchestrator(true);
     }
 
     requestImmortalBaseTile() {
@@ -141,10 +154,12 @@ class Application {
 
     handleSessionReady(msg) {
         this.baseTileRequested = false;
+        this.lastSentViewSignature = null;
         this.viewport.setImageDimensions(msg);
         this.renderer.updateGeometry(msg.originalWidth, msg.originalHeight, msg.tileSize, msg.maxZoom);
         this.updateImageTitle(msg);
-        this.viewport.resetToCover();
+        if (this.lastDatasetId !== msg.datasetId) this.viewport.resetToCover();
+        this.lastDatasetId = msg.datasetId;
         if (this.protocol.isReady()) {
             this.requestImmortalBaseTile();
             this.scheduleSyncView();
@@ -186,59 +201,71 @@ class Application {
         }
     }
 
-    dispatchSyncViewOrchestrator() {
+    createViewSignature(bounds) {
+        const ds = this.lastDatasetId || 'default';
+        const generation = this.protocol.generationId;
+        const cx = Math.round(bounds.centerX);
+        const cy = Math.round(bounds.centerY);
+        return `${generation}|${ds}|${bounds.zoom}|${bounds.minX}|${bounds.minY}|${bounds.maxX}|${bounds.maxY}|${cx}|${cy}`;
+    }
+
+    dispatchSyncViewOrchestrator(force = false) {
         const bounds = this.viewport.computeVisibleBounds();
-        const boundsChanged = !this.lastRequestedBounds ||
-            this.lastRequestedBounds.zoom !== bounds.zoom ||
-            this.lastRequestedBounds.minX !== bounds.minX ||
-            this.lastRequestedBounds.maxX !== bounds.maxX ||
-            this.lastRequestedBounds.minY !== bounds.minY ||
-            this.lastRequestedBounds.maxY !== bounds.maxY;
-
-        if (boundsChanged) {
-            this.lastEpoch++;
-            this.lastRequestedBounds = {
-                zoom: bounds.zoom,
-                minX: bounds.minX,
-                maxX: bounds.maxX,
-                minY: bounds.minY,
-                maxY: bounds.maxY
-            };
-        }
-
-        this.protocol.sendSyncView(bounds, this.lastEpoch);
+        const signature = this.createViewSignature(bounds);
+        if (!force && signature === this.lastSentViewSignature) return false;
+        const epoch = this.lastEpoch + 1;
+        if (!this.protocol.sendSyncView(bounds, epoch)) return false;
+        this.lastEpoch = epoch;
+        this.lastSentViewSignature = signature;
+        return true;
     }
 
     bindUiControls() {
-        document.getElementById('btn-zoom-in')?.addEventListener('click', () => {
-            this.viewport.applyZoomStep(1);
-        });
+        this.bindZoomControls();
+        this.bindDisplayControls();
+        this.bindActionControls();
+    }
 
-        document.getElementById('btn-zoom-out')?.addEventListener('click', () => {
-            this.viewport.applyZoomStep(-1);
-        });
+    bindZoomControls() {
+        document.getElementById('btn-zoom-in')?.addEventListener('click', () => this.viewport.applyZoomStep(1));
+        document.getElementById('btn-zoom-out')?.addEventListener('click', () => this.viewport.applyZoomStep(-1));
+        document.getElementById('btn-zoom-100')?.addEventListener('click', () => this.handleZoom100());
+        document.getElementById('btn-reset-view')?.addEventListener('click', () => this.handleResetView());
+    }
 
-        document.getElementById('btn-fullscreen')?.addEventListener('click', () => {
-            this.toggleFullscreen();
-        });
+    bindDisplayControls() {
+        document.getElementById('btn-fullscreen')?.addEventListener('click', () => this.toggleFullscreen());
+        document.getElementById('btn-toggle-telemetry')?.addEventListener('click', () => this.hud.toggleTelemetryPanel());
+        document.getElementById('btn-interpolation')?.addEventListener('click', () => this.handleToggleInterpolation());
+        document.getElementById('btn-toggle-grid')?.addEventListener('click', (e) => this.handleToggleGrid(e));
+    }
 
-        document.getElementById('btn-reset-view')?.addEventListener('click', () => {
-            this.viewport.resetToCover();
-            this.hud.showToast('Vista restablecida al modo panorámico');
-        });
+    bindActionControls() {
+        document.getElementById('btn-abort-test')?.addEventListener('click', () => this.executeAbortSimulation());
+    }
 
-        document.getElementById('btn-toggle-telemetry')?.addEventListener('click', () => {
-            this.hud.toggleTelemetryPanel();
-        });
+    handleZoom100() {
+        if (this.viewport.zoomTo100Percent() === null) return;
+        this.hud.showToast('Zoom 1:1 (100% nativo) activado');
+    }
 
-        document.getElementById('btn-toggle-grid')?.addEventListener('click', (e) => {
-            const isVisible = this.renderer.toggleGrid();
-            e.currentTarget.classList.toggle('active', isVisible);
-        });
+    handleResetView() {
+        this.viewport.resetToCover();
+        this.hud.showToast('Vista restablecida al modo panorámico');
+    }
 
-        document.getElementById('btn-abort-test')?.addEventListener('click', () => {
-            this.executeAbortSimulation();
-        });
+    handleToggleInterpolation() {
+        const current = this.renderer.interpolationMode;
+        const nextMode = (current === 'smooth') ? 'pixels' : 'smooth';
+        this.renderer.setInterpolationMode(nextMode);
+        this.hud.setInterpolationLabel(nextMode);
+        const label = (nextMode === 'pixels') ? 'Píxeles nítidos' : 'Suave';
+        this.hud.showToast(`Modo visual: ${label}`);
+    }
+
+    handleToggleGrid(e) {
+        const isVisible = this.renderer.toggleGrid();
+        e.currentTarget.classList.toggle('active', isVisible);
     }
 
     toggleFullscreen() {
@@ -250,8 +277,9 @@ class Application {
     }
 
     executeAbortSimulation() {
+        this.lastSentViewSignature = null;
         this.protocol.sendAbort(this.lastEpoch);
-        this.hud.showToast('¡ABORT enviado! Disminución Multiplicativa activada (CWND=1)');
+        this.hud.showToast('Cancelación ABORT solicitada para la demanda pendiente');
     }
 
     runRenderLoop() {

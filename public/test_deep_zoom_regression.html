@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>UHIP: Pruebas de Regresión de Zoom Profundo</title>
+    <style>
+        body { background: #0e1117; color: #e6edf3; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 24px; }
+        h1 { font-size: 1.4rem; color: #58a6ff; margin-bottom: 8px; }
+        #summary { font-size: 1.1rem; margin-bottom: 16px; font-weight: bold; }
+        ul { list-style: none; padding: 0; }
+        li { padding: 8px 12px; margin-bottom: 6px; border-radius: 4px; font-size: 0.95rem; }
+        .pass { background: #0d281e; color: #3fb950; border: 1px solid #238636; }
+        .fail { background: #341215; color: #f85149; border: 1px solid #da3633; }
+    </style>
+</head>
+<body>
+    <h1>UHIP: Pruebas de Regresión de Zoom Profundo (32×, L1, SYNC_VIEW, Clipping)</h1>
+    <p id="summary">Ejecutando suite de verificación...</p>
+    <ul id="results"></ul>
+
+    <script type="module">
+        import { runDeepZoomRegressions } from './js/tests/deep-zoom-regression.js';
+
+        const results = await runDeepZoomRegressions();
+        const resultsList = document.getElementById('results');
+        let passed = 0;
+
+        for (const res of results) {
+            const item = document.createElement('li');
+            item.className = res.passed ? 'pass' : 'fail';
+            item.textContent = `${res.passed ? '✔ PASS' : '✖ FAIL'} ${res.name}${res.error ? ': ' + res.error : ''}`;
+            resultsList.appendChild(item);
+            if (res.passed) passed++;
+        }
+
+        const summaryEl = document.getElementById('summary');
+        summaryEl.textContent = `${passed}/${results.length} pruebas aprobadas (${passed === results.length ? '100% ÉXITO' : 'REGRESIÓN DETECTADA'})`;
+        summaryEl.style.color = (passed === results.length) ? '#3fb950' : '#f85149';
+    </script>
+</body>
+</html>

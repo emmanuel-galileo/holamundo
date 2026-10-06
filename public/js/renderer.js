@@ -10,21 +10,39 @@ export class CanvasRenderer {
      * @param {HTMLCanvasElement} canvas
      * @param {TileCache} cache
      * @param {number} tileSize
+     * @param {Object} [options]
      */
-    constructor(canvas, cache, tileSize = 256) {
+    constructor(canvas, cache, tileSize = 256, options = {}) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { alpha: false });
         this.cache = cache;
         this.tileSize = tileSize;
         this.showGrid = false;
         this.lastStableLevel = 0;
+        this.interpolationMode = options.initialInterpolationMode || 'smooth';
         this.geometry = new PyramidGeometry(40192, 30208, tileSize, 8);
         this.configureContext();
     }
 
+    setInterpolationMode(mode) {
+        this.interpolationMode = (mode === 'pixels') ? 'pixels' : 'smooth';
+        this.configureContext();
+        return this.interpolationMode;
+    }
+
     configureContext() {
-        this.ctx.imageSmoothingEnabled = true;
-        this.ctx.imageSmoothingQuality = 'high';
+        if (this.interpolationMode === 'pixels') {
+            this.ctx.imageSmoothingEnabled = false;
+        } else {
+            this.ctx.imageSmoothingEnabled = true;
+            if ('imageSmoothingQuality' in this.ctx) {
+                this.ctx.imageSmoothingQuality = 'high';
+            }
+        }
+    }
+
+    onCanvasResized() {
+        this.configureContext();
     }
 
     updateGeometry(originalWidth, originalHeight, tileSize, maxZoom) {
@@ -71,10 +89,26 @@ export class CanvasRenderer {
         const screenY = -viewport.camY;
         const rootDim = this.geometry.rootContentDimensions();
 
+        this.drawClippedRootBitmap(base, rootDim, screenX, screenY, worldW, worldH);
+    }
+
+    drawClippedRootBitmap(base, rootDim, screenX, screenY, worldW, worldH) {
+        const dstX0 = Math.max(0, screenX);
+        const dstY0 = Math.max(0, screenY);
+        const dstX1 = Math.min(this.canvas.width, screenX + worldW);
+        const dstY1 = Math.min(this.canvas.height, screenY + worldH);
+        if (dstX1 <= dstX0 || dstY1 <= dstY0) return;
+
+        const sx0 = Math.max(0, Math.min(rootDim.srcW, ((dstX0 - screenX) / worldW) * rootDim.srcW));
+        const sx1 = Math.max(0, Math.min(rootDim.srcW, ((dstX1 - screenX) / worldW) * rootDim.srcW));
+        const sy0 = Math.max(0, Math.min(rootDim.srcH, ((dstY0 - screenY) / worldH) * rootDim.srcH));
+        const sy1 = Math.max(0, Math.min(rootDim.srcH, ((dstY1 - screenY) / worldH) * rootDim.srcH));
+        if (sx1 <= sx0 || sy1 <= sy0) return;
+
         this.ctx.drawImage(
             base,
-            0, 0, rootDim.srcW, rootDim.srcH,
-            screenX, screenY, worldW, worldH
+            sx0, sy0, sx1 - sx0, sy1 - sy0,
+            dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0
         );
     }
 

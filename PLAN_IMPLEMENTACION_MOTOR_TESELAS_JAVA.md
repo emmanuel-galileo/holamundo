@@ -2,7 +2,9 @@
 
 Fecha del análisis: 4 de octubre de 2026.
 
-Estado: propuesta basada en la revisión del proyecto y de la fuente local de libvips. Este documento no implementa cambios de código, no agrega dependencias y no modifica las teselas existentes. Las clases y configuraciones descritas a continuación son propuestas, salvo cuando se identifican como componentes actuales.
+Actualización del 5 de octubre de 2026: se implementó el motor Java; el alcance real, diferencias respecto a esta propuesta y pruebas están en [MOTOR_TESELAS_JAVA.md](MOTOR_TESELAS_JAVA.md). Este plan conserva el diagnóstico histórico.
+
+Estado original: propuesta basada en la revisión del proyecto y de la fuente local de libvips. Este documento no implementa cambios de código, no agrega dependencias y no modifica las teselas existentes. Las clases y configuraciones descritas a continuación son propuestas, salvo cuando se identifican como componentes actuales.
 
 ## 1. Decisión recomendada y alcance
 

@@ -41,6 +41,12 @@ public final class ClientSession {
     private volatile TransferContext activeTransfer;
     private volatile ActiveBatch activeBatch;
     private volatile Future<?> activeTimeoutFuture;
+    private final Queue<Runnable> commands = new ArrayDeque<>();
+    private boolean serialRunning;
+    private volatile boolean helloComplete;
+    private boolean waitingForCredit;
+    private Runnable closeListener = () -> {};
+    private final Set<String> failedForEpoch = ConcurrentHashMap.newKeySet();
 
     public ClientSession(String clientId, TileManager tileManager, ExecutorService virtualThreadExecutor) {
         this.clientId = clientId;
@@ -64,13 +70,87 @@ public final class ClientSession {
     public TileDispatcher getDispatcher() { return dispatcher; }
     public SessionState getState() { return state; }
     public int getCurrentEpoch() { return currentEpoch; }
-    public void setCurrentEpoch(int epoch) { this.currentEpoch = epoch; }
+    public synchronized void setCurrentEpoch(int epoch) { this.currentEpoch = Math.max(this.currentEpoch, epoch); }
     public String getSessionGenerationId() { return sessionGenerationId; }
     public String getDatasetId() { return datasetId; }
     public WebSocket getControlConnection() { return controlConnection; }
     public WebSocket getDataConnection() { return dataConnection; }
-    public void setControlConnection(WebSocket conn) { this.controlConnection = conn; }
-    public void setDataConnection(WebSocket conn) { this.dataConnection = conn; }
+    public synchronized void setControlConnection(WebSocket conn) { this.controlConnection = conn; }
+    public synchronized void setDataConnection(WebSocket conn) { this.dataConnection = conn; }
+    public boolean isHelloComplete() { return helloComplete && state != SessionState.CLOSED; }
+    public boolean ownsControl(WebSocket conn) { return state != SessionState.CLOSED && controlConnection == conn; }
+    public boolean ownsData(WebSocket conn) { return state != SessionState.CLOSED && dataConnection == conn; }
+    public void setCloseListener(Runnable listener) { closeListener = listener; }
+
+    public synchronized void closeIfOwned(WebSocket conn) {
+        if (ownsControl(conn) || ownsData(conn)) close();
+    }
+
+    public synchronized boolean pairData(WebSocket conn, String generation) {
+        if (!isHelloComplete() || !sessionGenerationId.equals(generation) || !controlConnection.isOpen()) return false;
+        if (dataConnection != null && dataConnection != conn) return false;
+        dataConnection = conn;
+        sendDataReady();
+        return true;
+    }
+
+    /** Queue insertion uses a separate lock so WebSocket selector threads never wait for disk reads. */
+    public void executeSerial(Runnable command) {
+        boolean start;
+        synchronized (commands) {
+            if (state == SessionState.CLOSED) return;
+            if (commands.size() >= 256) { command = () -> handleSessionError("Control queue overflow", null); commands.clear(); }
+            commands.add(command);
+            start = !serialRunning;
+            serialRunning = true;
+        }
+        if (start) virtualThreadExecutor.submit(this::drainCommands);
+    }
+
+    private void drainCommands() {
+        for (;;) {
+            Runnable command;
+            synchronized (commands) {
+                command = commands.poll();
+                if (command == null) { serialRunning = false; return; }
+            }
+            try { if (state != SessionState.CLOSED) command.run(); }
+            catch (Exception ex) { handleSessionError("Session command failed", ex); }
+        }
+    }
+
+    public synchronized void handleSyncView(int epoch, int zoom, int minX, int minY, int maxX, int maxY, int cx, int cy) {
+        if (state == SessionState.CLOSED || epoch < currentEpoch) return;
+        validateViewport(zoom, minX, minY, maxX, maxY);
+        if (epoch > currentEpoch) failedForEpoch.clear();
+        setCurrentEpoch(epoch);
+        waitingForCredit = false;
+        dispatcher.enqueueViewport(epoch, zoom, minX, minY, maxX, maxY, cx, cy);
+        ensureBootstrapRootTask(epoch);
+        triggerDispatch();
+        broadcastTelemetry();
+    }
+
+    private void validateViewport(int zoom, int minX, int minY, int maxX, int maxY) {
+        if (zoom > tileManager.getGeometry().getMaxZoom()) throw new IllegalArgumentException("Invalid zoom");
+        var bounds = tileManager.getGeometry().clampBounds(zoom, minX, minY, maxX, maxY);
+        long area = (long) (bounds.maxX() - bounds.minX() + 1) * (bounds.maxY() - bounds.minY() + 1);
+        if (area > 4096) throw new IllegalArgumentException("Viewport demand too large");
+    }
+
+    public synchronized void handleCreditAvailable(String generation) {
+        if (!sessionGenerationId.equals(generation) || !waitingForCredit || state == SessionState.CLOSED) return;
+        waitingForCredit = false;
+        dispatcher.reconcileDemand();
+        ensureBootstrapRootTask(currentEpoch);
+        triggerDispatch();
+    }
+
+    public synchronized void handleAbort(int epoch) {
+        dispatcher.cancelEpoch(epoch);
+        trafficEngine.onAbort();
+        broadcastTelemetry();
+    }
 
     public int getActiveBatchId() {
         ActiveBatch batch = this.activeBatch;
@@ -78,6 +158,12 @@ public final class ClientSession {
     }
 
     public synchronized void resetGeneration() {
+        if (state == SessionState.CLOSED) return;
+        cancelActiveTimeout();
+        dispatcher.clearDemand();
+        failedForEpoch.clear();
+        waitingForCredit = false;
+        currentEpoch = 0;
         this.sessionGenerationId = UUID.randomUUID().toString();
         this.residentConfirmedKeys.clear();
         this.lastResidencySeq = 0;
@@ -86,13 +172,13 @@ public final class ClientSession {
     }
 
     public boolean isTileExcluded(String key) {
-        return residentConfirmedKeys.contains(key) || keyOwnership.containsKey(key);
+        return residentConfirmedKeys.contains(key) || keyOwnership.containsKey(key) || failedForEpoch.contains(key);
     }
 
     public synchronized void handleEvict(String genId, String key, long residencySeq) {
         if (!sessionGenerationId.equals(genId)) return;
         if (key == null || key.isEmpty()) return;
-        if (residencySeq >= this.lastResidencySeq) {
+        if (residencySeq > this.lastResidencySeq) {
             this.lastResidencySeq = residencySeq;
             residentConfirmedKeys.remove(key);
             reconcileEvictedKey(key);
@@ -100,19 +186,21 @@ public final class ClientSession {
     }
 
     private void reconcileEvictedKey(String key) {
-        if (dispatcher.getPendingCount() > 0) {
-            triggerDispatch();
-        }
+        dispatcher.reconcileDemand();
+        ensureBootstrapRootTask(currentEpoch);
+        triggerDispatch();
     }
 
     public synchronized void handleHello(String version, long maxMemory) {
+        if (state == SessionState.CLOSED) return;
         resetGeneration();
+        helloComplete = true;
         sendSessionReady();
         broadcastTelemetry();
     }
 
     public void triggerDispatch() {
-        virtualThreadExecutor.submit(this::pumpBatchOrchestration);
+        executeSerial(this::pumpBatchOrchestration);
     }
 
     public synchronized void ensureBootstrapRootTask(int epoch) {
@@ -128,6 +216,9 @@ public final class ClientSession {
     ) {
         if (!isValidAck(genId, batchId, epoch, grantId, sentCount, omittedCount, terminalResults, admittedKeys)) {
             return false;
+        }
+        if (activeBatch.getOriginEpoch() == currentEpoch) {
+            terminalResults.forEach((key, status) -> { if ("failed_decode".equals(status)) failedForEpoch.add(key); });
         }
         finalizeSuccessfulBatch(admittedKeys, residencySeq);
         return true;
@@ -172,6 +263,8 @@ public final class ClientSession {
         applyResidencyUpdate(admittedKeys, residencySeq);
         releaseTransferContext();
         resetToIdle();
+        dispatcher.reconcileDemand();
+        ensureBootstrapRootTask(currentEpoch);
         broadcastTelemetry();
         scheduleNextDispatchIfPending();
     }
@@ -186,7 +279,7 @@ public final class ClientSession {
     }
 
     private synchronized void pumpBatchOrchestration() {
-        if (state != SessionState.IDLE || !canTransmit()) return;
+        if (state != SessionState.IDLE || waitingForCredit || !canTransmit()) return;
         int cwnd = trafficEngine.getCwnd();
         List<TileDispatcher.TileTask> tasks = dispatcher.pollBatch(cwnd);
         if (tasks.isEmpty()) return;
@@ -241,6 +334,8 @@ public final class ClientSession {
                 ctx.getSentTasks().add(t);
                 ctx.getSentJpegs().add(jpeg);
                 count++;
+            } else {
+                failedForEpoch.add(key);
             }
         }
         return count;
@@ -260,10 +355,22 @@ public final class ClientSession {
             handleSessionError("Invalid BATCH_ACCEPT received", null);
             return;
         }
+        if (new HashSet<>(acceptedKeys).size() != acceptedKeys.size() || !offeredKeys(activeTransfer).containsAll(acceptedKeys)) {
+            handleSessionError("Accepted keys outside offer", null);
+            return;
+        }
         cancelActiveTimeout();
         activeTransfer.setGrantId(grantId);
         filterAcceptedCandidates(activeTransfer, new HashSet<>(acceptedKeys));
         executeAcceptedTransmission(activeTransfer);
+    }
+
+    private Set<String> offeredKeys(TransferContext context) {
+        Set<String> keys = new HashSet<>();
+        for (UhipCodec.BatchPlannedItem item : context.getPlannedItems()) {
+            keys.add(item.zoom() + ":" + item.tileX() + ":" + item.tileY());
+        }
+        return keys;
     }
 
     private void filterAcceptedCandidates(TransferContext ctx, Set<String> acceptedSet) {
@@ -315,14 +422,16 @@ public final class ClientSession {
     }
 
     public synchronized void handleBatchDefer(String genId, int batchId, String reason) {
+        if (!sessionGenerationId.equals(genId)) return;
         if (state != SessionState.WAITING_CREDIT || activeTransfer == null || activeTransfer.getBatchId() != batchId) {
             return;
         }
         cancelActiveTimeout();
-        List<TileDispatcher.TileTask> tasks = activeTransfer.getSentTasks();
+        List<TileDispatcher.TileTask> tasks = List.copyOf(activeTransfer.getSentTasks());
         releaseTransferContext();
         dispatcher.reenqueueTasks(tasks);
         resetToIdle();
+        waitingForCredit = true;
     }
 
     private void transmitBatchFrames(TransferContext ctx) {
@@ -371,32 +480,21 @@ public final class ClientSession {
         }
     }
 
-    private void armOfferTimeout(int batchId) {
+    private void armOfferTimeout(int batchId) { armTimeout(batchId, 3000, SessionState.WAITING_CREDIT); }
+    private void armBatchTimeout(int batchId) { armTimeout(batchId, 5000, SessionState.AWAITING_ACK); }
+
+    private void armTimeout(int batchId, long milliseconds, SessionState expected) {
         cancelActiveTimeout();
-        this.activeTimeoutFuture = virtualThreadExecutor.submit(() -> {
-            try {
-                Thread.sleep(3000);
-                synchronized (ClientSession.this) {
-                    if (state == SessionState.WAITING_CREDIT && activeTransfer != null && activeTransfer.getBatchId() == batchId) {
-                        handleOfferTimeout();
-                    }
-                }
-            } catch (InterruptedException ignored) {}
+        String generation = sessionGenerationId;
+        activeTimeoutFuture = virtualThreadExecutor.submit(() -> {
+            try { Thread.sleep(milliseconds); executeSerial(() -> expireTransfer(generation, batchId, expected)); }
+            catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
         });
     }
 
-    private void armBatchTimeout(int batchId) {
-        cancelActiveTimeout();
-        this.activeTimeoutFuture = virtualThreadExecutor.submit(() -> {
-            try {
-                Thread.sleep(5000);
-                synchronized (ClientSession.this) {
-                    if (state == SessionState.AWAITING_ACK && activeBatch != null && activeBatch.getBatchId() == batchId) {
-                        handleBatchTimeout();
-                    }
-                }
-            } catch (InterruptedException ignored) {}
-        });
+    private synchronized void expireTransfer(String generation, int batchId, SessionState expected) {
+        if (!sessionGenerationId.equals(generation) || state != expected || activeTransfer == null || activeTransfer.getBatchId() != batchId) return;
+        if (expected == SessionState.AWAITING_ACK) handleBatchTimeout(); else handleOfferTimeout();
     }
 
     private void cancelActiveTimeout() {
@@ -406,31 +504,16 @@ public final class ClientSession {
         }
     }
 
-    private void handleOfferTimeout() {
-        List<TileDispatcher.TileTask> tasks = (activeTransfer != null) ? activeTransfer.getSentTasks() : null;
-        releaseTransferContext();
-        if (tasks != null) {
-            dispatcher.reenqueueTasks(tasks);
-        }
-        resetToIdle();
-        scheduleNextDispatchIfPending();
-    }
+    private void handleOfferTimeout() { handleSessionError("Offer credit timeout", null); }
 
     private void handleBatchTimeout() {
         trafficEngine.onCongestion();
-        releaseTransferContext();
-        resetToIdle();
-        broadcastTelemetry();
-        scheduleNextDispatchIfPending();
+        handleSessionError("Batch acknowledgement timeout", null);
     }
 
     public synchronized void handleSessionError(String reason, Throwable cause) {
-        cancelActiveTimeout();
-        releaseTransferContext();
-        resetToIdle();
-        trafficEngine.onCongestion();
-        broadcastTelemetry();
-        System.err.printf("[UHIP] Session %s error (%s): %s\n", clientId, reason, (cause != null ? cause.getMessage() : "none"));
+        System.err.printf("[UHIP] Session %s closed (%s): %s%n", clientId, reason, cause == null ? "none" : cause.getMessage());
+        close();
     }
 
     private void releaseTransferContext() {
@@ -442,26 +525,37 @@ public final class ClientSession {
 
     private void resetToIdle() {
         this.activeBatch = null;
-        this.state = SessionState.IDLE;
+        if (state != SessionState.CLOSED) this.state = SessionState.IDLE;
     }
 
     private void scheduleNextDispatchIfPending() {
         if (dispatcher.getPendingCount() > 0) {
-            virtualThreadExecutor.submit(this::pumpBatchOrchestration);
+            executeSerial(this::pumpBatchOrchestration);
         }
     }
 
     public synchronized void close() {
-        this.state = SessionState.CLOSED;
+        if (state == SessionState.CLOSED) return;
+        state = SessionState.CLOSED;
+        helloComplete = false;
+        sessionGenerationId = UUID.randomUUID().toString();
         cancelActiveTimeout();
         releaseTransferContext();
+        activeBatch = null;
         residentConfirmedKeys.clear();
-        closeSocketsIfOpen();
+        failedForEpoch.clear();
+        dispatcher.clearDemand();
+        synchronized (commands) { commands.clear(); }
+        closeOwnedSockets();
+        closeListener.run();
     }
 
-    private void closeSocketsIfOpen() {
-        if (controlConnection != null && controlConnection.isOpen()) controlConnection.close();
-        if (dataConnection != null && dataConnection.isOpen()) dataConnection.close();
+    private void closeOwnedSockets() {
+        WebSocket control = controlConnection, data = dataConnection;
+        controlConnection = null;
+        dataConnection = null;
+        if (control != null && control.isOpen()) control.close();
+        if (data != null && data.isOpen()) data.close();
     }
 
     public void sendSessionReady() {

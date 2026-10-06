@@ -463,7 +463,12 @@ html, body {
     transition: var(--transition-smooth);
 }
 
-.dock-btn:hover {
+.dock-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.dock-btn:hover:not(:disabled) {
     background: rgba(0, 229, 255, 0.14);
     border-color: rgba(0, 229, 255, 0.45);
     color: var(--accent-cyan);
@@ -480,6 +485,31 @@ html, body {
     border-color: rgba(0, 229, 255, 0.5);
     color: var(--accent-cyan);
     box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+}
+
+.dock-btn.text-btn {
+    width: auto;
+    min-width: 44px;
+    padding: 0 10px;
+    border-radius: 19px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+
+.dock-badge {
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.08);
+    border: 1px solid rgba(0, 229, 255, 0.25);
+    border-radius: 12px;
+    min-width: 48px;
+    text-align: center;
+    letter-spacing: 0.2px;
 }
 
 .dock-btn.warning {

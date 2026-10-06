@@ -93,7 +93,7 @@ public class TestPendingCorrections {
         assert session.isTileExcluded("1:0:0") : "Acquired key must be excluded during transfer";
 
         session.handleSessionError("Simulated pipe failure", new RuntimeException("Broken pipe"));
-        assert session.getState() == ClientSession.SessionState.IDLE : "Session state must return to IDLE after error";
+        assert session.getState() == ClientSession.SessionState.CLOSED : "Uncertain transfer must close the generation after error";
         assert !session.isTileExcluded("1:0:0") : "Key must be released from keyOwnership after error (C1)";
         System.out.println("     ✔ Key ownership safely released on error without lock leak.");
     }

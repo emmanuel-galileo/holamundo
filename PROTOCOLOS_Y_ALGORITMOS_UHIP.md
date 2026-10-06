@@ -7,7 +7,9 @@
 
 Este documento es un catálogo de la implementación actual. No es un plan de implementación ni una declaración de ausencia de errores. Distingue los algoritmos publicados de sus adaptaciones locales, los protocolos de los formatos de archivo y las funciones activas de los elementos que solamente están declarados.
 
-El servidor utiliza Java 21. El cliente actual utiliza JavaScript con módulos ES, HTML, CSS y Canvas 2D; no utiliza Angular. El procesamiento principal de imágenes grandes sigue delegándose al ejecutable libvips embebido cuando está disponible. La carpeta con el código C clonado de libvips no implica que exista ya un clon de ese motor implementado en Java.
+El inventario ampliado que incluye todos los codecs propios y el mapa detallado de archivos está en [CATALOGO_ALGORITMOS_Y_PROTOCOLOS_UHIP.md](CATALOGO_ALGORITMOS_Y_PROTOCOLOS_UHIP.md).
+
+El servidor utiliza Java 21. El cliente actual utiliza JavaScript con módulos ES, HTML, CSS y Canvas 2D; no utiliza Angular. La preparación permite elegir el motor Java propio o el libvips embebido, descritos en [MOTOR_TESELAS_JAVA.md](MOTOR_TESELAS_JAVA.md). La fuente C clonada es referencia; la alternativa libvips ejecuta los binarios instalados, exclusivamente cuando se elige ese motor.
 
 ## 1. Vista general del funcionamiento
 
@@ -17,7 +19,7 @@ El cliente calcula el nivel de resolución y las coordenadas necesarias para su 
 
 ```mermaid
 flowchart LR
-    I[Imagen original] --> P[Preparación: libvips o REDUCE Java]
+    I[Imagen original] --> P[Preparación: Java o libvips]
     P --> D[Pirámide de JPEG en disco]
     H[HTTP Java: aplicación web] --> N[Navegador]
     N -->|Control JSON: vista y crédito| S[Sesión Java]
@@ -41,8 +43,8 @@ flowchart LR
 | UHIP v1.0, plano de datos | Protocolo binario propio | Transportar manifiestos y teselas mediante tres operaciones binarias. | `UhipCodec`, `ClientSession`, `public/js/protocol.js`. |
 | `BATCH_STREAM_V2` | Identificador de perfil de aplicación | Identificar el flujo de negociación de lotes en el mensaje `HELLO`. | `ProtocolClient.sendHello()`. |
 | JSON | Formato de intercambio | Representar mensajes de control y metadatos de la pirámide. | `protocol.js`, `ControlWebSocket`, `TileManager`, herramientas de corte. |
-| JPEG | Formato de imagen comprimida | Almacenar y transportar el contenido de las teselas. | libvips, `TileCutter`, `TileManager`, `decodeJpegBitmap()`. |
-| Deep Zoom | Organización de pirámide usada durante el procesamiento | Salida intermedia de `vips dzsave`, reorganizada a niveles UHIP. | `VipsTileSlicer.executeDzSave()` y `reorganizeDzLevels()`. |
+| JPEG | Formato de imagen comprimida | Almacenar y transportar el contenido de las teselas. | `JpegEncoder`, `TileCutter`, `TileManager`, `decodeJpegBitmap()`. |
+| Pirámide UHIP | Organización multirresolución | Niveles rectangulares y bordes físicos. Java los genera directamente; libvips prepara Deep Zoom intermedio y lo normaliza al contrato UHIP. | `PyramidJob`, `RegionReducer`, `VipsTileSlicer`. |
 
 ### 1.2 Inventario de los seis algoritmos principales
 
@@ -53,9 +55,9 @@ flowchart LR
 | SIEVE | `public/js/cache.js` | Elegir qué bitmap residente desalojar del cliente. | Adaptación con presupuesto por bytes, protección visual y préstamos de frame. |
 | S3-FIFO | `S3FifoCache.java` | Reutilizar JPEG leídos por el servidor. | Implementación con colas S, M y G, frecuencias pequeñas y límite de bytes. |
 | AMP, adaptación espacial | `public/js/viewport.js` | Anticipar franjas de teselas según el movimiento. | Heurística de velocidad inspirada en AMP; no reproduce íntegramente el algoritmo del artículo. |
-| Burt–Adelson REDUCE | `BurtAdelsonReducer.java` y `TileCutter.java` | Construir niveles reducidos en la ruta Java de procesamiento. | Filtro separable de cinco coeficientes y reducción por dos. |
+| Burt–Adelson REDUCE | `RegionReducer.java` | Construir niveles reducidos por regiones en el motor Java. | Filtro separable de cinco coeficientes y reducción por dos. |
 
-Además se utilizan algoritmos y mecanismos auxiliares: generación de pirámides con libvips, teselación rectangular, cálculo geométrico multirresolución, selección de nivel, respaldo jerárquico, interpolación de zoom, inercia, lectura single-flight, sustitución de demanda por épocas, deduplicación, memoria con crédito y reconexión con espera exponencial. Se describen en las secciones 4 y 5.
+Además se utilizan algoritmos y mecanismos auxiliares: generación de pirámides Java, teselación rectangular, cálculo geométrico multirresolución, selección de nivel, respaldo jerárquico, interpolación de zoom, inercia, lectura single-flight, sustitución de demanda por épocas, deduplicación, memoria con crédito y reconexión con espera exponencial. Se describen en las secciones 4 y 5.
 
 ## 2. Protocolos de comunicación
 
@@ -145,13 +147,14 @@ JSON es un formato de intercambio definido en [RFC 8259](https://www.rfc-editor.
 | `HELLO` | Cliente → servidor | `clientVersion`, `protocolProfile`, `clientId`, `maxMemoryBytes` en el emisor. | `sendHello()` → `handleHello()`: iniciar generación y publicar metadatos. |
 | `SESSION_READY` | Servidor → cliente | `generationId`, `datasetId`, `originalWidth`, `originalHeight`, `tileSize`, `maxZoom`. | `sendSessionReady()` → `handleSessionReady()`: establecer geometría y abrir datos. |
 | `DATA_READY` | Servidor → cliente | `generationId`. | `sendDataReady()` → `handleDataReady()`: habilitar el envío de la vista. |
-| `SYNC_VIEW` | Cliente → servidor | `epoch`, `zoom`, `minX`, `minY`, `maxX`, `maxY`, `centerX`, `centerY`. | `sendSyncView()` → `handleSyncView()`: sustituir la demanda pendiente y despachar. |
+| `SYNC_VIEW` | Cliente → servidor | `epoch`, `zoom`, `minX`, `minY`, `maxX`, `maxY`, `centerX`, `centerY`. | `sendSyncView()` → `ControlWebSocket.handleView()` → `ClientSession.handleSyncView()`: sustituir la demanda pendiente y despachar. |
 | `BATCH_OFFER` | Servidor → cliente | `generationId`, `batchId`, `epoch`, `candidates`. | `sendBatchOffer()` → `handleBatchOffer()`: ofrecer las teselas y sus costos. |
 | `BATCH_ACCEPT` | Cliente → servidor | `generationId`, `batchId`, `grantId`, `acceptedKeys`. | `emitBatchAccept()` → `handleBatchAccept()`: aceptar un subconjunto con memoria reservada. |
 | `BATCH_DEFER` | Cliente → servidor | `generationId`, `batchId`, `reason`. | `emitBatchDefer()` → `handleBatchDefer()`: aplazar un lote; devolver sus tareas a la cola. |
 | `BATCH_START` | Servidor → cliente | `generationId`, `batchId`, `epoch`, `count`, `cwnd`. | Emitido por `notifyControlBatchStart()`; el cliente actual no tiene un caso específico para este mensaje. |
 | `ACK_BATCH` | Cliente → servidor | `generationId`, `batchId`, `epoch`, `grantId`, `sentCount`, `omittedCount`, `terminalResults`, `admittedKeys`, `residencySeq`. | `sendAckBatch()` → `handleAckBatch()`: terminar el lote y actualizar residencia/Vegas. |
 | `EVICT` | Cliente → servidor | `generationId`, `key`, `residencySeq`. | `sendEvict()` → `handleEvict()`: informar el desalojo de una tesela. |
+| `CREDIT_AVAILABLE` | Cliente → servidor | `generationId`. | `sendCreditAvailable()` → `handleCreditAvailable()`: reanudar demanda aplazada tras cambios de capacidad/protección. |
 | `ABORT` | Cliente → servidor | `epoch`. | `sendAbort()` → `handleAbort()`: cancelar tareas pendientes hasta esa época. |
 | `CWND_UPDATE` | Servidor → cliente | `algorithm`, `cwnd`, `rtt`, `baseRtt`, `diff`, `pending`, `maxZoom`. | `broadcastTelemetry()` → `updateCwndTelemetry()`: mostrar estado real del control de lotes. |
 | `GET_IMAGE_INFO` | Cliente → servidor | `type`. | Aceptado por el servidor; responde mediante `sendSessionReady()`. El visor normal no lo emite. |
@@ -249,13 +252,11 @@ UHIP no incorpora en estos mensajes un CRC propio, cifrado propio, retransmisió
 
 ### 2.8 Formatos de procesamiento y almacenamiento
 
-**JPEG.** libvips genera teselas con `.jpg[Q=85]`. La ruta Java utiliza `ImageWriter`, compresión explícita y calidad `0.85`. `TileManager` obtiene esos bytes y `UhipCodec` los encapsula sin volver a comprimirlos. El navegador usa `Blob` con `image/jpeg` y `createImageBitmap()`. El proyecto utiliza codecs existentes; no implementa su propia DCT, cuantización o codificación entrópica JPEG.
+**JPEG.** En el motor Java, `JpegEncoder` produce JFIF baseline YCbCr 4:4:4 con DCT separable, cuantización de calidad 85 por defecto, zigzag y Huffman canónico propio. Los lectores y descompresores de imagen son Java. `TileManager` entrega los bytes sin recomprimir y el navegador usa `createImageBitmap()`.
 
-**Metadatos JSON.** Cada dataset puede incluir `metadata.json` con `originalWidth`, `originalHeight`, `tileSize` y `maxZoom`. `TileManager.detectImageDimensions()` intenta leerlos y, si faltan, examina el nivel máximo de archivos. Ese fallback estima dimensiones por la cuadrícula de teselas y no recupera con precisión un borde parcial si carece de metadatos.
+**Pirámide UHIP.** Con Java, `PyramidJob` genera directamente `z/x_y.jpg`, `metadata.json` y `manifest.json`. Hay teselas de 256, solapamiento cero y bordes parciales. En esta ruta no hay `.dzi`. Con libvips, `VipsTileSlicer` ejecuta `dzsave`, verifica y renumera niveles Deep Zoom, elimina los intermedios y publica el mismo contrato.
 
-**Deep Zoom.** `vips dzsave` genera niveles y un archivo `.dzi` intermedios. `reorganizeDzLevels()` selecciona como base el nivel 8 cuando existe, descarta niveles inferiores y renumera los retenidos desde cero. El resultado que se sirve es la organización UHIP, no un visor que consulte `.dzi` mediante el protocolo Deep Zoom.
-
-**Dónde se implementa:** [VipsTileSlicer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/VipsTileSlicer.java>), [TileCutter.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/TileCutter.java>) y [TileManager.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/storage/TileManager.java>).
+**Dónde se implementa:** `tools/TileSlicer.java`, `tools/VipsTileSlicer.java`, `tools/JavaTileSlicer.java`, `imaging/PyramidJob.java`, `imaging/RegionReducer.java` y `imaging/codec/JpegEncoder.java`. La matriz de formatos y la descripción de todos los codecs están en [MOTOR_TESELAS_JAVA.md](MOTOR_TESELAS_JAVA.md).
 
 ## 3. Algoritmos principales
 
@@ -289,7 +290,7 @@ Si `diff < 2`, incrementa la ventana en una tesela. Si `diff > 5`, la reduce en 
 
 El RTT medido incluye el tiempo que transcurre hasta el ACK de aplicación: transporte, espera y procesamiento del cliente pueden influir. El registro actual ocurre después de encolar las tramas del lote, por lo que tampoco es una medición exacta de todos los costos de preparación. No representa el RTT TCP del sistema operativo.
 
-Un timeout o error invoca `onCongestion()` y resta uno, respetando el mínimo. `onAbort()` conserva la ventana; no la colapsa a uno. La implementación actual no utiliza slow start, reducción multiplicativa a la mitad ni `ssthresh` para este motor, aunque `ServerConfig` conserva campos con esos nombres.
+El timeout de ACK invoca `onCongestion()` y resta uno, respetando el mínimo, antes de cerrar la sesión incierta. Al reconectar se crea otro motor con ventana inicial 32. `onAbort()` conserva la ventana; no la colapsa a uno. La implementación actual no utiliza slow start, reducción multiplicativa a la mitad ni `ssthresh` para este motor, aunque `ServerConfig` conserva campos con esos nombres.
 
 **Ejemplo:** para `cwnd=32`, `baseRTT=20 ms` y `actualRTT=25 ms`, `diff=6.4`; el próximo ajuste reduce la ventana a 31. La prioridad espacial de las teselas la decide Manhattan; Vegas regula la cantidad.
 
@@ -311,7 +312,7 @@ Las tareas se almacenan en `PriorityQueue<TileTask>` con un comparador ascendent
 
 **Ejemplo:** con centro `(5,5)`, las prioridades de `(5,5)`, `(6,5)` y `(8,7)` son 0, 1 y 5. El usuario recibe antes el entorno central que las zonas lejanas.
 
-El cálculo de una distancia cuesta tiempo constante; cada inserción o extracción de la cola cuesta normalmente `O(log n)`. El comparador actual no introduce un criterio adicional para desempatar distancias iguales. La raíz de respaldo entra con prioridad 0 y puede empatar con una tesela central; no existe un desempate explícito que garantice que siempre sea el primer elemento.
+El cálculo de una distancia cuesta tiempo constante; cada inserción o extracción de la cola cuesta normalmente `O(log n)`. El comparador desempata por nivel, Y y X, después de la prioridad. La raíz de respaldo entra con prioridad 0 y nivel 0, por lo que precede una tesela central de nivel mayor que empate en prioridad.
 
 La cuadrícula válida se obtiene de `PyramidGeometry`, para evitar la suposición de que toda imagen es cuadrada. Manhattan no determina cuánto tráfico emitir ni qué bitmap desalojar: trabaja junto con Vegas y las cachés.
 
@@ -354,6 +355,8 @@ La política no es LRU exacto. Además, las lecturas de renderizado marcan `visi
 
 El presupuesto predeterminado de payload es 128 MiB. S tiene un umbral de aproximadamente el 10 % del presupuesto; M utiliza el espacio restante disponible, sujeto al límite total. G se limita a 4,000 claves por defecto.
 
+Solo hay desalojo cuando `bytesS + bytesM > maxBytes`. El umbral del 10 % selecciona la cola que debe revisar bajo esa presión; durante el calentamiento S puede excederlo y utilizar capacidad libre. Un payload mayor que todo el presupuesto no se admite y no provoca la expulsión de residentes. El constructor exige un presupuesto positivo y un límite G no negativo; G=0 desactiva el histórico.
+
 Una entrada empieza con frecuencia 0. Los hits aumentan la frecuencia hasta un máximo de 3. Una clave nueva entra en S; una clave encontrada en G entra directamente en M y sale del histórico.
 
 Al retirar el elemento más antiguo de S, se lo promueve a M si `freq > 1`, reiniciando la frecuencia. De lo contrario se eliminan sus bytes y se registra la clave en G. En M, una frecuencia positiva concede otra oportunidad: decrementa la frecuencia y reinserta al final. Si vale cero, se eliminan los bytes. En esta implementación, el desalojo desde M no agrega una clave a G.
@@ -366,21 +369,25 @@ La caché pertenece a `TileManager`, compartido por las sesiones del servidor. P
 
 **Nombre y origen:** AMP, *Adaptive Multi-stream Prefetching in a Shared Cache*, de Binny S. Gill y Luis Angel D. Bathen, FAST 2007. Referencia: [publicación de AMP](https://www.usenix.org/conference/fast-07/amp-adaptive-multi-stream-prefetching-shared-cache).
 
-**Dónde se usa:** [viewport.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/viewport.js>), clase `AmpTilePrefetcher`, métodos `adaptStreamX()`, `adaptStreamY()`, `updateVelocity()` y `getDegrees()`; integración mediante `Viewport.applyAmpStreamPrefetch()`.
+**Dónde se usa:** [viewport.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/viewport.js>), clase `AmpTilePrefetcher`, métodos `computeDegree()`, `updateVelocity()`, `getDegrees()` y `getPredictedTravel()`; integración mediante `Viewport.applyAmpStreamPrefetch()`.
 
 El código adapta la idea de anticipación a dos ejes de una imagen. Mantiene grados `pX` y `pY` entre 0 y 4 teselas y observa velocidad/dirección por eje.
 
 Para cada eje:
 
 ```text
-si |velocidad| < 0.2: p = 0
-si se invierte el signo respecto a la velocidad anterior: p = 0
+velocidad = desplazamiento / max(0.001, dt_segundos)
+si |velocidad| < 5 px/s o se invierte la dirección: p = 0
 en otro caso:
-    objetivo = min(4, max(1, floor(|velocidad| / 10)))
-    p = round(0.7 * p + 0.3 * objetivo)
+    viaje = |velocidad| * 0.300 segundos
+    límite_por_viaje = ceil(viaje / max(1, tamaño_tesela_en_pantalla))
+    grado_por_velocidad = min(4, max(1, floor(|velocidad| / 400)))
+    objetivo = min(4, límite_por_viaje, grado_por_velocidad)
+    p = 0.7 * p + 0.3 * objetivo
+grado_utilizado = ceil(p)
 ```
 
-`applyAmpStreamPrefetch()` amplía los límites hacia la dirección de `dx` y `dy`. Después los restringe a las dimensiones reales del nivel. Conserva el centro de la vista estricta para que Manhattan siga priorizando la zona que el usuario está mirando.
+`getPredictedTravel()` conserva el signo de la velocidad y proyecta 300 ms de movimiento. `applyAmpStreamPrefetch()` agrega únicamente las bandas que alcanzarían los límites proyectados, hasta el grado permitido, y restringe el resultado a la geometría real. Conserva el centro de la vista estricta para que Manhattan siga priorizando la zona que el usuario está mirando.
 
 Como se transmite un rectángulo de límites, ampliar simultáneamente ambos ejes también puede incluir la esquina formada por esas ampliaciones. El prefetch no usa un manifiesto separado de dos bandas independientes.
 
@@ -388,52 +395,29 @@ Como se transmite un rectángulo de límites, ampliar simultáneamente ambos eje
 
 La anticipación aumenta la demanda enviada al servidor, mientras Manhattan organiza el orden y Vegas regula la cantidad por lote. No elimina la necesidad de una imagen de respaldo.
 
-### 3.6 Burt–Adelson REDUCE: reducción de imagen en Java
+### 3.6 Burt–Adelson REDUCE: reducción por regiones en Java
 
-**Nombre y origen:** operador REDUCE para pirámides de Burt y Adelson. Referencia: [The Laplacian Pyramid as a Compact Image Code, 1983](https://www.rctn.org/bruno/public/papers/Laplacian-pyramid-Burt%2BAdelson1983.pdf).
+**Nombre y origen:** operador REDUCE de Burt y Adelson, 1983. Se usa como filtro predeterminado de `JavaTileSlicer` / `PyramidJob`.
 
-**Dónde se usa:** [BurtAdelsonReducer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/pyramid/BurtAdelsonReducer.java>), métodos `reduce()`, `executeHorizontalPass()`, `executeVerticalPass()` y `clampIndex()`; llamado por `TileCutter.buildBurtAdelsonPyramid()`.
+**Dónde:** `imaging/RegionReducer.java`, `region()`, `burt()` y `horizontal()`. El método `pyramid/BurtAdelsonReducer.reduce()` permanece como referencia para pruebas pequeñas.
 
-El filtro unidimensional utilizado es:
+El filtro separable `[1,5,8,5,1]/20` se aplica con halo de dos muestras, centros en coordenadas globales y réplica del borde. Mantiene los acumuladores intermedios sin división y redondea una sola vez con `(suma+200)/400`. La salida mide `ceil(W/2) × ceil(H/2)`. Las pruebas contrastan todos los píxeles con la implementación de referencia y cubren costuras de regiones y dimensiones impares.
 
-```text
-w = [1, 5, 8, 5, 1] / 20
-```
-
-Su extensión bidimensional es separable: aplica una pasada horizontal y otra vertical. Cada nivel toma muestras alrededor de `(2x,2y)` del nivel anterior y reduce a:
-
-```text
-ancho_salida = ceil(ancho_entrada / 2)
-alto_salida  = ceil(alto_entrada / 2)
-```
-
-La primera pasada conserva sumas enteras sin dividir por 20. La segunda combina esas sumas y normaliza una sola vez por 400, con redondeo `(+200)/400`. Trabaja con canales RGB y replica el valor del borde al limitar índices fuera de la imagen.
-
-**Ejemplo:** una imagen 257 × 129 produce un nivel 129 × 65. Los niveles siguientes se obtienen repitiendo la operación.
-
-El filtro reduce detalle de alta frecuencia antes de submuestrear. Su costo por nivel es lineal en la cantidad de píxeles con un número fijo de coeficientes. La ruta Java usa `BufferedImage` y mantiene un arreglo de niveles; requiere memoria proporcional a la imagen cargada y no equivale a un motor de procesamiento por regiones para cualquier archivo de cientos de gigabytes.
-
-Esta ruta construye una pirámide de imágenes suavizadas. No genera residuos de una pirámide laplaciana ni implementa todo el sistema de codificación del artículo. Se utiliza cuando se llama directamente a `TileCutter` para una imagen real o cuando `VipsTileSlicer` no encuentra el ejecutable libvips. La ruta normal con libvips no ejecuta esta clase para reducir cada nivel.
+Se construye una pirámide suavizada; no hay residuos laplacianos. Los niveles se guardan sin pérdidas en disco y se procesan por regiones acotadas, sin cargar un nivel completo en RAM. La opción `--reducer box` selecciona una media 2 × 2 alternativa.
 
 ## 4. Algoritmos de procesamiento, geometría y presentación
 
-### 4.1 Generación de pirámides con libvips `dzsave`
+### 4.1 Generación de pirámides con selección Java/libvips
 
-**Nombre:** generación multirresolución Deep Zoom mediante libvips. libvips es un motor de procesamiento; `dzsave` es la operación usada por el proyecto. Referencia: [Building image pyramids, documentación oficial](https://www.libvips.org/API/current/making-image-pyramids.html).
+`PyramidJob.run()` coordina inspección real del original, reserva de recursos, importación secuencial o lectura directa de planos RAW, codificación JPEG con pool acotado, REDUCE a disco, comprobación de conteos y publicación atómica. `ImageReaders` selecciona por firma los lectores PNG, JPEG baseline, PSD/PSB y TIFF/BigTIFF.
 
-**Dónde se usa:** `VipsTileSlicer.sliceImageOrchestrator()`, `findEmbeddedVips()`, `executeDzSave()` y `reorganizeDzLevels()`. Java inicia el proceso nativo con `ProcessBuilder`.
-
-La invocación activa configura tamaño de tesela **256**, solapamiento **0** y salida JPEG de calidad **85**. No fija explícitamente `region-shrink`, `layout` ni `depth`. La documentación y el código C clonado de `libvips/libvips/foreign/dzsave.c` describen como valores predeterminados la reducción por media de regiones 2 × 2, organización Deep Zoom y profundidad hasta un píxel. Esta identificación describe esos valores predeterminados; el comando Java no selecciona REDUCE de Burt–Adelson para esta ruta.
-
-Después del procesamiento, Java renumera los niveles, publica `metadata.json` y organiza los JPEG para `TileManager`. El `.dzi` es intermedio y se elimina durante la limpieza.
-
-Este motor permite preparar imágenes mediante su propia arquitectura de procesamiento por regiones. El proyecto no implementa en Java los algoritmos internos de cada lector de TIFF, PSB, JPEG u otros formatos que soporte el ejecutable. Tampoco activa todos los filtros presentes en el repositorio C clonado: solamente utiliza las operaciones invocadas por `VipsTileSlicer`.
+Cuando se selecciona Java, la compresión de imagen y JPEG se implementan en Java: DCT, Huffman, LZ77/DEFLATE, PackBits, LZW, CRC/Adler, filtros PNG y predictores PSD/TIFF. Los JPEG no son intermedios de la reducción. El destino debe ser nuevo y no se publica en caso de error/cancelación. Esta ruta no ejecuta conversores nativos ni Python. La alternativa libvips usa `dzsave` con tesela 256, solapamiento cero, JPEG de calidad 85 y reducción por media; comparte `DatasetPublisher` y `DatasetMetadata` para la publicación y el contrato de archivos. `TileSlicer`/`SliceRequest` seleccionan explícitamente el motor; no hay cambio automático en caso de fallo. Véase [MOTOR_TESELAS_JAVA.md](MOTOR_TESELAS_JAVA.md) para clases, variantes implementadas, recursos y límites; no se afirma compatibilidad general con toda la API de libvips.
 
 ### 4.2 Teselación rectangular y generación procedural de pruebas
 
 **Nombre:** partición espacial por cuadrícula y generación de datasets sintéticos.
 
-**Dónde se usa:** `TileCutter.sliceLevelTiles()`, `generateSyntheticDatasetOrchestrator()`, `generateZoomLevel()` y `createProceduralTile()`.
+**Dónde se usa:** `PyramidJob.writeLevel()`, `TileCutter.generateSyntheticDatasetOrchestrator()`, `generateZoomLevel()` y `createProceduralTile()`.
 
 Para un nivel de ancho `Wz`, alto `Hz` y tamaño `T=256`, el corte usa:
 
@@ -522,9 +506,11 @@ La raíz se protege en `TileCache`, y se vuelve a incorporar a la demanda desde 
 
 **Dónde se usa:** `CanvasRenderer.computeTileScreenRect()` y `PyramidGeometry.tileContentDimensions()`.
 
-El destino de cada tesela se calcula a partir de su extensión original, la escala continua y la posición de cámara. Los bordes de destino se ajustan con `floor` y `ceil`; el origen de muestreo conserva las fracciones útiles de la geometría.
+El destino de cada tesela se calcula a partir de su extensión original, la escala continua y la posición de cámara. Los extremos de destino se ajustan con `round` y se restan para obtener ancho y alto, compartiendo el mismo redondeo entre vecinos; el origen de muestreo conserva las fracciones útiles de la geometría.
 
 El contexto Canvas configura `imageSmoothingEnabled=true` e `imageSmoothingQuality='high'`. El navegador elige cómo realiza ese suavizado. El proyecto no implementa un interpolador bicúbico o Lanczos propio dentro de `CanvasRenderer`.
+
+El modo Píxeles cambia `imageSmoothingEnabled` a `false`; la elección visual no genera nuevas peticiones de teselas.
 
 ### 4.7 Zoom con interpolación hacia el objetivo
 
@@ -535,10 +521,12 @@ El contexto Canvas configura `imageSmoothingEnabled=true` e `imageSmoothingQuali
 En cada frame:
 
 ```text
-escala_actual += 0.22 * (escala_objetivo - escala_actual)
+dt = clamp(dt_segundos, 0.001, 0.05)
+tasa = 1 - (1 - 0.22)^(dt * 60)
+escala_actual += tasa * (escala_objetivo - escala_actual)
 ```
 
-Se actualiza mientras la diferencia absoluta supere **0.00005**. `adjustCameraForScaleChange()` modifica la cámara para preservar el punto bajo el cursor como ancla del zoom.
+Se actualiza mientras `abs(objetivo-actual) / max(1e-6, objetivo)` supere **1e-6**; al alcanzar la tolerancia se asigna el objetivo exacto. `adjustCameraForScaleChange()` modifica la cámara para preservar el punto bajo el cursor como ancla del zoom. El delta se acota en la actualización normal del viewport.
 
 La rueda modifica el objetivo por un factor 1.18 o su inverso. Los botones utilizan 1.4 o su inverso. Estas constantes son decisiones de interacción del proyecto, no propiedades de UHIP ni de un artículo de algoritmos.
 
@@ -568,6 +556,18 @@ El objetivo es cubrir el canvas con la imagen. `clampPosition()` limita la cáma
 
 Este mecanismo impide navegar fuera de los límites geométricos; la disponibilidad de las teselas sigue siendo responsabilidad del protocolo, la caché y el respaldo.
 
+### 4.10 Zoom digital profundo, deduplicación canónica y modo de interpolación dual
+
+**Nombre:** Ampliación digital en Canvas 2D, firma canónica de SYNC_VIEW y conmutación de suavizado.
+
+**Dónde se usa:** `Viewport.applyScaleFactor()`, `Viewport.zoomTo100Percent()`, `CanvasRenderer.setInterpolationMode()`, `CanvasRenderer.drawClippedRootBitmap()`, `Application.createViewSignature()`, `Application.dispatchSyncViewOrchestrator()`.
+
+1. **Ampliación visual hasta 32× (3200%):** La cámara permite ampliar la escala continua hasta `maxVisualScale` (32.0 por defecto, configurable entre 1 y 64). En todo momento, el nivel discreto de pirámide se acota a $z \le M = \text{maxZoom}$.
+2. **Clipping proporcional de la raíz:** `drawClippedRootBitmap()` intersecta el destino con el Canvas y proyecta proporcionalmente el recorte fuente en la raíz. Evita enviar a `drawImage()` un rectángulo de destino de toda la imagen ampliada; no se presupone un límite GPU universal.
+3. **Deduplicación de SYNC_VIEW:** La firma local `${generationId}|${datasetId}|${zoom}|${minX}|${minY}|${maxX}|${maxY}|${centerX}|${centerY}` incluye la generación y solo se registra si el socket acepta el envío. Se deduplican vistas con los mismos límites/centro entero; `DATA_READY` fuerza el reenvío y ABORT invalida la firma. Un fallo no consume época ni firma.
+4. **Modo de interpolación dual:** Suave solicita `imageSmoothingQuality = 'high'` al navegador sin imponer un kernel concreto; Píxeles usa `imageSmoothingEnabled = false`. El modo se restaura después de resize, que conserva el centro en coordenadas originales capturado antes de cambiar el Canvas. La acción 100% se deshabilita cuando `minScale > 1`.
+5. **AMP a escala profunda:** `getPredictedTravel()` proyecta velocidad durante 300 ms; `applyAmpStreamPrefetch()` calcula qué fronteras alcanzaría y añade solo esas bandas, con grado adaptativo máximo de cuatro. Un movimiento dentro de una tesela a 32× no obliga a anticipar otra; acercarse a su frontera puede anticipar una sin recorrer antes toda la tesela. Manhattan mantiene el centro de los límites estrictamente visibles.
+
 ## 5. Mecanismos auxiliares de demanda, concurrencia y memoria
 
 ### 5.1 Sustitución de demanda por épocas
@@ -594,7 +594,7 @@ La cancelación de cola no retira bytes ya encolados en WebSocket ni detiene por
 
 Cada `TransferContext` tiene un token UUID. Al finalizar se elimina la propiedad mediante la pareja clave/token, lo que evita que una liberación de una transferencia anterior borre la propiedad de otra transferencia distinta.
 
-El ACK agrega residencia; `EVICT` la elimina. `residencySeq` aplica un orden global por sesión. La actualización actual de ACK exige una secuencia mayor; EVICT permite una secuencia mayor o igual. Esta lógica reduce resurrecciones por mensajes antiguos, pero no constituye un registro causal independiente para cada clave.
+El ACK agrega residencia; `EVICT` la elimina. `residencySeq` aplica un orden global por sesión. La actualización actual de ACK exige una secuencia mayor; EVICT también exige una secuencia estrictamente mayor. Esta lógica reduce resurrecciones por mensajes antiguos, pero no constituye un registro causal independiente para cada clave.
 
 El conjunto [BoundedKeySet.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/session/BoundedKeySet.java>) limita la residencia recordada a 512 claves. Utiliza `LinkedHashSet`, elimina la entrada más antigua al llenarse y renueva la posición al volver a insertar una clave existente. Es un conjunto acotado por orden de inserción actualizado, no la caché S3-FIFO de bytes ni un LRU por cada lectura.
 
@@ -620,21 +620,21 @@ stateDiagram-v2
     IDLE --> PREPARING: hay demanda y canal de datos abierto
     PREPARING --> WAITING_CREDIT: oferta enviada
     WAITING_CREDIT --> SENDING: aceptación válida
-    WAITING_CREDIT --> IDLE: defer o timeout de oferta
+    WAITING_CREDIT --> IDLE: defer, esperar crédito
     SENDING --> AWAITING_ACK: tramas encoladas
-    AWAITING_ACK --> IDLE: ACK válido o timeout
+    AWAITING_ACK --> IDLE: ACK válido
     IDLE --> CLOSED: cierre
     PREPARING --> CLOSED: cierre
-    WAITING_CREDIT --> CLOSED: cierre
+    WAITING_CREDIT --> CLOSED: cierre o timeout de 3 s
     SENDING --> CLOSED: cierre
-    AWAITING_ACK --> CLOSED: cierre
+    AWAITING_ACK --> CLOSED: cierre o timeout de 5 s
 ```
 
 Mientras la sesión espera el ACK no inicia un segundo lote normal. El tamaño ofrecido depende de Vegas y de las tareas existentes. Esta espera se parece a un flujo de tipo stop-and-wait aplicado a lotes, pero no implementa un nuevo protocolo ARQ de segmentos.
 
-`armOfferTimeout()` espera **3 segundos**. `armBatchTimeout()` espera **5 segundos**. Se ejecutan como tareas del ejecutor de sesión y se cancelan cuando llega la transición esperada.
+`armOfferTimeout()` espera **3 segundos**. `armBatchTimeout()` espera **5 segundos**. La espera utiliza hilos virtuales; la expiración entra al coordinador FIFO y verifica generación, lote y estado. El timeout invalida la generación y cierra ambos canales; reconectar negocia otra generación y reenvía la vista con su raíz.
 
-Cada cliente dispone de su propio dispatcher, motor Vegas, generación y estado de lote. Comparte con los demás el almacenamiento y su caché. Hay métodos sincronizados para cambios de sesión; las tareas de control se lanzan en hilos virtuales independientes. Esto no equivale a disponer ya de un coordinador FIFO único por sesión para todos los eventos.
+Cada cliente dispone de su propio dispatcher, motor Vegas, generación y estado de lote. Comparte con los demás el almacenamiento y su caché. Los mensajes de control, el bombeo de lotes y las expiraciones utilizan `executeSerial()`/`drainCommands()`, un coordinador FIFO por sesión sobre hilos virtuales. Admite hasta 256 comandos pendientes; saturarlo cierra la sesión. Los cambios de sockets verifican propiedad por identidad. `CLOSED` es terminal. `setCurrentEpoch()` no retrocede y una vista antigua se ignora antes de sustituir demanda.
 
 ### 5.5 Crédito de memoria y contabilidad R + T + J + D + G
 
@@ -663,7 +663,7 @@ costo comprimido reservado = 2 * longitud_JPEG + 18
 
 Para una tesela completa 256 × 256, el raster contabilizado es **262,144 bytes**, equivalentes a 256 KiB. La reserva comprimida intenta representar payload/buffer y Blob además de la cabecera asociada; es un modelo de contabilidad, no una medición exacta de todas las copias internas del navegador.
 
-Antes de aceptar una candidata se intenta reservar su costo. Si hace falta espacio, SIEVE busca víctimas no protegidas. Al llegar el JPEG, parte de G pasa a J. Al iniciar decode, la reserva raster pasa de G a D. Al admitir el bitmap, D pasa a R y se libera el costo J. Fallos, descartes y omisiones liberan las cuentas correspondientes.
+Antes de aceptar se reserva su costo y una plaza nueva si no está residente. `reserveCredit()` devuelve un token o `null`; las transiciones reciben ese token, no cantidades sueltas. Residentes más plazas nuevas reservadas no superan 512 por defecto; el crédito comprimido en G más JPEG en J no supera `maxPendingJpegBytes` (8 MiB por defecto). Liberar tokens es idempotente. Si hace falta espacio, SIEVE busca víctimas no protegidas. Al llegar el JPEG, parte de G pasa a J. Al iniciar decode, la reserva raster pasa de G a D. Al admitir el bitmap, D pasa a R y se libera el costo J. Fallos, descartes y omisiones liberan las cuentas correspondientes.
 
 Esta suma limita memoria administrada por el código. No incluye con precisión todo el heap JavaScript, memoria del DOM, backing store del canvas, estructuras del motor gráfico o buffers de red del navegador. Tampoco es un límite de toda la JVM: la caché Java de JPEG tiene su propio presupuesto y las transferencias activas conservan referencias fuera de ella.
 
@@ -673,7 +673,7 @@ Esta suma limita memoria administrada por el código. No incluye con precisión 
 
 **Dónde se usa:** `ProtocolClient.decodeQueue`, `pumpDecodeQueue()`, `executeDecodeTask()`, `finalizeDecodedTask()` y `cleanupDecodeTask()`.
 
-Se ejecutan como máximo **cuatro** decodificaciones simultáneas. El resto permanece en cola. Cada tarea conserva lote, generación, clave y reserva. La conversión usa `createImageBitmap()`; después se comprueban generación y relevancia antes de admitir.
+Se ejecutan como máximo **cuatro** decodificaciones simultáneas por defecto; `Application` pasa ese límite local de `CLIENT_CONFIG` a `ProtocolClient`, sin mensaje de red. El resto permanece en cola. Cada tarea conserva lote, generación, revisión local de sesión, clave y token. Ante falla se vacían colas y créditos inactivos. Los decodes iniciados mantienen su cargo J/D hasta terminar; los resultados obsoletos se cierran sin admisión ni ACK. La conversión usa `createImageBitmap()`; después se comprueban generación y relevancia antes de admitir.
 
 Los resultados terminales permiten completar el lote aunque una tesela falle o deje de ser pertinente. La limitación evita iniciar una decodificación por cada JPEG recibido sin control. No debe describirse como un grupo de cuatro Web Workers creado por el proyecto: se utilizan promesas y el servicio de decodificación del navegador.
 
@@ -695,7 +695,7 @@ La finalidad es conservar la vida útil del recurso hasta finalizar su uso y con
 
 Los intentos se programan con esperas de **1, 2, 4 y 8 segundos**, permaneciendo en 8 para los intentos siguientes. `isReconnecting` intenta evitar programar varios temporizadores simultáneos y `DATA_READY` restablece la espera inicial. No se añade jitter aleatorio.
 
-La recuperación intenta cerrar ambos canales, retirar la caché de la generación y abrir nuevamente control. Es un mecanismo implementado con limitaciones de ciclo de vida descritas en la sección 7; su presencia no prueba que todos los eventos tardíos estén aislados correctamente.
+La recuperación cierra ambos canales, invalida inmediatamente la generación, retira la caché y abre nuevamente control. Cada callback verifica el socket vigente; al retirar sockets se separan sus callbacks antes de cerrar. El servidor también verifica propiedad y elimina del registro la instancia exacta sin esperar a que `isClosed()` cambie durante el callback. Se conserva la vista cuando reconecta al mismo dataset.
 
 ### 5.9 Agrupación temporal de actualizaciones de vista
 
@@ -725,6 +725,8 @@ Los enlaces apuntan al código inspeccionado en el workspace de esta revisión. 
 | [TransferContext.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/session/TransferContext.java>) | Propiedad temporal de claves mediante token y datos de la transferencia. |
 | [BoundedKeySet.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/session/BoundedKeySet.java>) | Conjunto acotado de claves residentes confirmadas. |
 | [UhipCodec.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/protocol/UhipCodec.java>) | Big-endian, cabecera y codecs `BATCH_BEGIN`, `TILE_DATA`, `BATCH_END`. |
+| [StrictJson.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/protocol/StrictJson.java>) | Parser JSON completo y acotado, rechazo de duplicados y entrada sobrante. |
+| [ControlMessage.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/protocol/ControlMessage.java>) | Esquemas, tipos y campos obligatorios antes de mutar sesión. |
 | [TrafficEngine.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/traffic/TrafficEngine.java>) | Vegas adaptado: RTT de aplicación, Diff y ajuste de ventana. |
 | [TileDispatcher.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/dispatch/TileDispatcher.java>) | Manhattan, cola prioritaria, épocas, deduplicación y reencolado. |
 | [TileManager.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/storage/TileManager.java>) | Metadatos, acceso a JPEG, caché compartida y single-flight. |
@@ -732,7 +734,9 @@ Los enlaces apuntan al código inspeccionado en el workspace de esta revisión. 
 | [PyramidGeometry.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/pyramid/PyramidGeometry.java>) | Límites y tamaños físicos de niveles/teselas del servidor. |
 | [BurtAdelsonReducer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/pyramid/BurtAdelsonReducer.java>) | Filtro REDUCE separable en Java. |
 | [TileCutter.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/TileCutter.java>) | Preparación Java, teselación, JPEG y datasets procedurales. |
-| [VipsTileSlicer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/VipsTileSlicer.java>) | Orquestación de libvips y conversión de niveles Deep Zoom a UHIP. |
+| [JavaTileSlicer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/JavaTileSlicer.java>) | Entrada directa al motor Java; `TileSlicer` ofrece selección común y `PyramidJob` genera niveles. |
+| [MOTOR_TESELAS_JAVA.md](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/MOTOR_TESELAS_JAVA.md>) | Mapa de codecs/algoritmos, buffers, archivos temporales y matriz de formatos. |
+| [VipsTileSlicer.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/VipsTileSlicer.java>) | Adaptador explícito de libvips, verificación y renumeración Deep Zoom. |
 | [GuiPicker.java](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/src/main/java/com/uhip/tools/GuiPicker.java>) | Selección de archivos/carpetas; interfaz auxiliar, sin algoritmo de imagen propio. |
 | [main.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/main.js>) | Coordinación del visor, generación de demanda, arranque de respaldo y relevancia geométrica. |
 | [protocol.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/protocol.js>) | WebSocket, UHIP JSON/binario, concesiones, decode, ACK, EVICT y backoff. |
@@ -743,7 +747,7 @@ Los enlaces apuntan al código inspeccionado en el workspace de esta revisión. 
 | [config.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/config.js>) | Valores declarados de memoria, entradas y decode del cliente. |
 | [hud.js](<C:/Users/Emmanuel Santos/Desktop/proyecto-imagenes-cc8/public/js/hud.js>) | Presentación de métricas: no sustituye la política de caché o tráfico. |
 
-## 7. Precisiones sobre el estado actual
+## 7. Precisiones sobre el estado actual (correcciones del 5 de octubre de 2026)
 
 Estas precisiones impiden atribuir al proyecto funciones que no están implementadas o garantías más fuertes que las verificadas. No convierten automáticamente cada decisión interna en un requisito del PDF académico.
 
@@ -751,20 +755,20 @@ Estas precisiones impiden atribuir al proyecto funciones que no están implement
 |---|---|
 | Algoritmos publicados | Vegas y AMP tienen adaptaciones locales; SIEVE y S3-FIFO incluyen políticas propias de memoria, protección o sincronización. Los resultados de rendimiento de sus artículos no son mediciones de este proyecto. |
 | Eliminación real | Se eliminan tareas pendientes, bytes de caché y bitmaps. Una cancelación no recupera bytes ya enviados o encolados ni cancela automáticamente toda tarea del navegador. |
-| Límite de entradas | Se configura 512; la admisión con raster previamente reservado evita la ruta que comprueba ese límite secundario. No está garantizado en todas las admisiones. |
-| JPEG pendiente | Se declara un máximo de 8 MiB en configuración/protocolo, pero `tryReserveCandidate()` no aplica un chequeo separado contra ese valor. Se usa el presupuesto combinado. |
-| Configuración de decode | El protocolo establece cuatro decodes en su constructor; no recibe toda `CLIENT_CONFIG` como política configurable de forma uniforme. |
-| ACK y JSON | Hay validación de lote/manifiesto, pero la extracción JSON por regex no valida completamente tipos y sintaxis. Por ejemplo, puede interpretar la parte entera de un número fraccionario. |
-| Recuperación de canales | Existen cierre coordinado y backoff, pero los callbacks actuales no comprueban siempre si pertenecen a la conexión vigente. Un cierre tardío o un canal rechazado puede afectar la sesión nueva. |
-| Limpieza de sesiones | `checkAndCleanupSession()` depende del estado de ambos sockets durante los callbacks. En la revisión se reprodujo una sesión `CLOSED` que permaneció registrada. |
-| Aplazamiento de oferta | `BATCH_DEFER` devuelve las tareas a la cola. El método no programa por sí mismo un nuevo intento cuando el cliente recupera capacidad sin enviar otra actualización. |
-| Timeout de lote | Reduce la ventana, libera la transferencia y vuelve a IDLE; no cambia obligatoriamente de generación ni reencola todas las tareas del lote cuyo ACK faltó. |
-| Épocas | El dispatcher rechaza épocas anteriores, pero `ClientSession.setCurrentEpoch()` es una asignación directa y el control no usa un coordinador FIFO por cliente. No se garantiza monotonicidad global ante cualquier reordenamiento de tareas. |
-| EVICT | Retira residencia recordada. No reconstruye por sí solo toda la demanda vigente cuando la cola ya está vacía. |
+| Límite de entradas | Residentes más plazas nuevas reservadas ≤512 por defecto, incluido el camino de admisión después de decode. |
+| JPEG pendiente | Crédito comprimido más JPEG materializado ≤8 MiB por defecto; aceptación parcial conserva las otras candidatas en el servidor. |
+| Configuración de decode | `Application` pasa `CLIENT_CONFIG` al protocolo, incluido el máximo predeterminado de cuatro decodes. |
+| ACK y JSON | Parser completo, esquemas, campos obligatorios y rangos antes de mutar. Decimales, exponentes y cadenas no son enteros del contrato. Se rechazan duplicados y entrada sobrante. |
+| Recuperación de canales | Se verifica identidad del socket. Un canal de datos rechazado no posee la sesión y su cierre no afecta a la pareja válida. |
+| Limpieza de sesiones | `close()` elimina tiempos, cola, demanda, claves y referencias; un listener elimina solo la instancia cerrada del registro. |
+| Aplazamiento de oferta | `BATCH_DEFER` verifica generación/lote, devuelve tareas y espera `CREDIT_AVAILABLE` o nueva vista. La notificación depende de cambios de capacidad/protección y se agrupa para evitar reintentos por frame. |
+| Timeout | Oferta sin respuesta a los 3 s o lote sin ACK a los 5 s: invalidar y cerrar pareja. Reconectar negocia otra generación y reenvía vista/raíz. |
+| Épocas | Control, bombeo y expiraciones usan FIFO por sesión; las épocas no retroceden y las vistas antiguas se ignoran. |
+| EVICT | Retira residencia y reconstruye demanda vigente aunque la cola física esté vacía. Finalizar lote también reconcilia trabajo todavía necesario. |
 | Respaldo | Se protege y solicita la raíz desde la demanda del servidor. La protección no crea un bitmap ausente ni representa una reserva de todos los niveles bajos. |
 | Soporte declarado en formato | WebP, otros opcodes históricos y operaciones de otros motores no participan en la ruta de datos actual solamente porque aparezcan en documentos antiguos. |
 
-No se utilizan en la ruta actual un caché LRU exacto de bitmaps, un controlador AIMD con slow start, una reducción multiplicativa de la ventana por ABORT ni un clon Java completo de libvips. Tampoco se utilizan OpenSeadragon o Leaflet como bibliotecas del visor: la lógica de respaldo y Canvas es propia del código JavaScript del proyecto.
+No se utilizan en la ruta actual un caché LRU exacto de bitmaps, un controlador AIMD con slow start, una reducción multiplicativa de la ventana por ABORT ni la API completa de libvips. La generación de teselas sí usa un motor Java propio con el alcance documentado. Tampoco se utilizan OpenSeadragon o Leaflet como bibliotecas del visor: la lógica de respaldo y Canvas es propia del código JavaScript del proyecto.
 
 El método `BoundedKeySet` no debe confundirse con S3-FIFO, el JPEG no debe contarse como un protocolo de control y los hilos virtuales no son un algoritmo de procesamiento de imágenes. Son herramientas y mecanismos que permiten ejecutar los algoritmos descritos.
 
@@ -780,21 +784,21 @@ En una reducción de zoom se solicitan teselas de otro nivel, se reutiliza el re
 
 ## 9. Evidencia de verificación y alcance
 
-En la revisión inmediatamente anterior a este documento se recompilaron las fuentes Java actuales y se ejecutaron con assertions habilitadas:
+El 5 de octubre de 2026 se recompilaron fuentes Java y el JAR local. Con assertions habilitadas se verificaron:
 
-- `TestS3FifoCache`: comportamiento básico y presupuesto de la caché del servidor.
-- `TestBurtAdelsonReducer`: reducción por dos y dimensiones impares.
-- `TestPyramidGeometry`: cuadrículas y tamaños de borde.
-- `TestFunctionalCorrections`: codecs de lote, geometría, sustitución de demanda y rechazo de ACK sin lote.
-- `TestPendingCorrections`: validación de ACK, duplicados, generación, liberación de propiedad y orden de residencia.
+- Las cinco suites existentes: `TestS3FifoCache`, `TestBurtAdelsonReducer`, `TestPyramidGeometry`, `TestFunctionalCorrections` y `TestPendingCorrections`.
+- `TestRecoveryIntegration`: ocho verificaciones con JSON y WebSockets reales, dataset JPEG temporal y puertos asignados por el sistema. Comprueba rechazo de mensajes malformados, sockets obsoletos, limpieza del registro, aceptación parcial, EVICT sin nueva vista, crédito tras DEFER, monotonía de épocas, timeout/reconexión y tres clientes con su nivel solicitado y raíz.
+- `TestMultiClient` y `TestUhipClient`: integración con el JAR recompilado y dataset sintético local.
+- `public/test_recovery_regression.html`: siete pruebas de límites, identidad de sockets, retiro de decodes, recuperación de crédito, tramas truncadas/manifiesto discrepante y ACK tras el último decode.
+- `public/test_cache_regression.html`: siete pruebas de caché/geometría. E5 usa capacidad para coexistir tres rasters y protege explícitamente la entrada que espera conservar.
 
-Las cinco suites pasaron. La prueba de red multicliente recibió teselas para tres clientes simultáneos. Una prueba adicional con aceptación inicial de solo dos candidatas recibió las diez ofrecidas en dos lotes, incluida la raíz, verificando el reencolado actual.
+Todas pasaron. Ambas suites HTML se ejecutaron en el navegador; también se probó el visor con tres pestañas y cambios rápidos de zoom, sin errores de consola. Las tres pestañas también recuperaron automáticamente conexión y teselas después de un reinicio controlado del servidor de prueba. El dataset de la prueba visual fue el sintético local de 2048 × 2048.
 
-Estas pruebas muestran funcionamiento de los casos ejercitados. No son mediciones de rendimiento sobre una imagen real de 700 GB, ni demuestran que todos los casos de reconexión, memoria y concurrencia estén resueltos. Los resultados de artículos académicos se citan como procedencia de ideas, sin trasladar sus cifras al proyecto.
+Estas pruebas cubren las regresiones reproducidas; no son mediciones sobre una imagen de 700 GB ni una cota de toda la memoria nativa del navegador/JVM. Los resultados publicados de algoritmos se citan como procedencia, sin trasladar sus cifras al proyecto.
 
 ## 10. Referencias y procedencia
 
-Las descripciones de comportamiento, métodos, constantes y estructuras de este catálogo provienen del código enlazado. Las fuentes externas identifican protocolos estándar, algoritmos originales y la operación utilizada de libvips.
+Las descripciones de comportamiento, métodos, constantes y estructuras de este catálogo provienen del código enlazado. Las fuentes externas identifican protocolos estándar, algoritmos originales y formatos de imagen.
 
 1. IETF. [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.txt) y [RFC 9112: HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112.txt).
 2. Fette, I.; Melnikov, A. [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/info/rfc6455).
@@ -805,4 +809,10 @@ Las descripciones de comportamiento, métodos, constantes y estructuras de este 
 7. Yang, J. y colaboradores. [FIFO Queues are All You Need for Cache Eviction](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf), SOSP 2023; [repositorio de los autores](https://github.com/Thesys-lab/sosp23-s3fifo).
 8. Gill, B. S.; Bathen, L. A. D. [AMP: Adaptive Multi-stream Prefetching in a Shared Cache](https://www.usenix.org/conference/fast-07/amp-adaptive-multi-stream-prefetching-shared-cache), FAST 2007.
 9. Burt, P. J.; Adelson, E. H. [The Laplacian Pyramid as a Compact Image Code](https://www.rctn.org/bruno/public/papers/Laplacian-pyramid-Burt%2BAdelson1983.pdf), 1983.
-10. libvips. [Building image pyramids](https://www.libvips.org/API/current/making-image-pyramids.html); valores predeterminados contrastados con `libvips/libvips/foreign/dzsave.c` en la fuente clonada local.
+10. [MOTOR_TESELAS_JAVA.md](MOTOR_TESELAS_JAVA.md): implementación propia y referencias primarias de formatos. La fuente local de libvips queda como antecedente del plan, sin compilarla para la alternativa Java; la alternativa libvips usa sus binarios instalados.
+
+La migración Java añadió `TestJavaImaging` (86 verificaciones de codecs y pipeline, además del caso grande con heap de 64 MiB). Estos resultados complementan la verificación de red ya descrita; no constituyen un ensayo con el original masivo real.
+
+La revisión posterior añadió `TestPngExif`: 29 verificaciones de orientación normal/ausente y rechazo controlado, con un caso adicional usando el perfil real de 180 bytes del PNG de 96.922 × 96.922. `PngDecoder.readExif()` valida CRC/tamaño y `ExifOrientation.checkPng()` lee cabecera TIFF/IFD0 en Java; ya no rechaza todo PNG por contener `eXIf`. No se procesó la imagen masiva completa. Las regresiones de zoom pasaron 14/14 en navegador con métodos reales del cliente y Canvas 2D; caché 7/7 y recuperación 7/7 también pasaron.
+
+La selección dual se verifica con `TestDualSlicing`: generación con libvips real y Java, metadatos idénticos, bordes y niveles, selección interactiva, opciones y errores.

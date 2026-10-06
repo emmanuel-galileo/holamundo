@@ -117,7 +117,7 @@
             // --- TEST 4: E5 - Deduplicación de Residencia y Hook onEvict ---
             try {
                 const tileBytes = 256 * 256 * 4;
-                const cache = new TileCache(tileBytes * 2, 2);
+                const cache = new TileCache(tileBytes * 3, 2);
                 const evictedKeys = [];
                 cache.onEvict = (key) => evictedKeys.push(key);
 
@@ -136,6 +136,7 @@
                 }
 
                 // Inserción key3 provoca desalojo SIEVE de key2: DEBE emitir EVICT
+                cache.updateVisibleKeys(new Set(['key1']));
                 cache.set('key3', b3);
                 if (evictedKeys.length !== 1 || evictedKeys[0] !== 'key2') {
                     throw new Error(`Desalojo real debió emitir EVICT para key2, obtenido: ${JSON.stringify(evictedKeys)}`);
@@ -202,18 +203,18 @@
                     throw new Error(`grantedBytes incorrecto: ${cache.grantedBytes}`);
                 }
 
-                cache.transitionGrantToJpeg(compBytes);
+                cache.transitionGrantToJpeg(reserved);
                 if (cache.grantedBytes !== tileBytes || cache.pendingJpegBytes !== compBytes) {
                     throw new Error('Transición G -> J incorrecta');
                 }
 
-                cache.transitionGrantToDecode(tileBytes);
+                cache.transitionGrantToDecode(reserved);
                 if (cache.grantedBytes !== 0 || cache.pendingDecodeBytes !== tileBytes) {
                     throw new Error('Transición G -> D incorrecta');
                 }
 
                 const b1 = new MockBitmap('b1');
-                const status = cache.admitDecoded('tile1', b1, tileBytes, compBytes);
+                const status = cache.admitDecoded('tile1', b1, reserved);
                 if (status !== 'ADMITTED') throw new Error(`Esperado ADMITTED, obtenido ${status}`);
                 if (cache.pendingJpegBytes !== 0 || cache.pendingDecodeBytes !== 0) {
                     throw new Error('Cargo J y D debió liberarse tras admisión');

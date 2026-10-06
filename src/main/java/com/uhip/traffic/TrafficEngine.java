@@ -1,11 +1,11 @@
 package com.uhip.traffic;
 
 /**
- * Implements Layer 7 Application Congestion Control using the formal TCP Vegas
- * algorithm (Brakmo & Peterson, 1994) for tile batch transmission.
+ * Adapts TCP Vegas congestion avoidance (Brakmo & Peterson, 1994) to Layer 7
+ * tile batches; it does not implement or configure the OS TCP controller.
  *
  * Regulates the congestion window (CWND) by measuring Round-Trip Time (RTT),
- * estimating queue volume (Diff) at the client, and adjusting the window smoothly
+ * estimating a delay signal (Diff), and adjusting the window smoothly
  * according to alpha and beta thresholds without waiting for packet loss.
  */
 public final class TrafficEngine {
@@ -44,7 +44,7 @@ public final class TrafficEngine {
     }
 
     /**
-     * Marks the departure timestamp of an outgoing tile batch.
+     * Records the timestamp after outgoing batch frames have been queued.
      */
     public synchronized void recordBatchStart() {
         this.batchStartTime = System.currentTimeMillis();
@@ -67,7 +67,7 @@ public final class TrafficEngine {
     }
 
     /**
-     * Orchestrator: Invoked when buffer backpressure or socket error occurs.
+     * Orchestrator: Invoked on ACK timeout before the session is closed.
      * Gently decrements window while respecting the minimum operational floor.
      */
     public synchronized void onCongestion() {

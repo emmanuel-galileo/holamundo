@@ -30,39 +30,27 @@ public final class DataWebSocket extends WebSocketServer {
         String clientId = WsUtils.extractClientId(conn);
         String genId = WsUtils.extractParam(conn, "generationId");
         ClientSession session = sessionManager.getSession(clientId);
-        if (session == null || !isValidGeneration(session, genId)) {
+        if (session == null || !session.pairData(conn, genId)) {
             conn.close(1008, "Stale or invalid generation");
-            return;
         }
-        session.setDataConnection(conn);
-        System.out.printf("[UHIP] Conexión Datos activa: %s (Total clientes: %d)\n", clientId, sessionManager.getActiveSessionCount());
-        session.sendDataReady();
-    }
-
-    private boolean isValidGeneration(ClientSession session, String genId) {
-        if (genId == null || genId.isEmpty()) return true;
-        return session.getSessionGenerationId().equals(genId);
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-        String clientId = WsUtils.extractClientId(conn);
-        ClientSession session = sessionManager.getSession(clientId);
-        if (session != null) {
-            session.close();
-        }
-        sessionManager.checkAndCleanupSession(clientId);
+        ClientSession session = owner(conn);
+        if (session != null) session.executeSerial(() -> session.closeIfOwned(conn));
     }
 
     @Override
     public void onError(WebSocket conn, Exception ex) {
-        if (conn != null) {
-            String clientId = WsUtils.extractClientId(conn);
-            ClientSession session = sessionManager.getSession(clientId);
-            if (session != null) {
-                session.handleSessionError("Data WebSocket error", ex);
-            }
-        }
+        ClientSession session = owner(conn);
+        if (session != null) session.executeSerial(() -> session.closeIfOwned(conn));
+    }
+
+    private ClientSession owner(WebSocket conn) {
+        if (conn == null) return null;
+        ClientSession session = sessionManager.getSession(WsUtils.extractClientId(conn));
+        return session != null && session.ownsData(conn) ? session : null;
     }
 
     @Override

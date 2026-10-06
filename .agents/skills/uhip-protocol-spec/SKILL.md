@@ -62,7 +62,7 @@ Validation Rule: If `Magic != 0x55` or `Version != 0x01`, immediately discard fr
      "generationId": "7e53b767-43cc-4bed-9bc6-3feb198d5ea1"
    }
    ```
-6. **Client Sends `SYNC_VIEW`:** Initiates demand for visible tiles. The server session automatically guarantees bootstrapping of the universal root tile `0:0:0` (with priority 0) in the initial offer until resident-confirmed, eliminating visual holes.
+6. **Client Sends `SYNC_VIEW`:** Initiates demand for visible tiles. The local deduplication signature is `${generationId}|${datasetId}|${zoom}|${minX}|${minY}|${maxX}|${maxY}|${centerX}|${centerY}`. Commit the signature and local epoch only after `WebSocket.send()` accepts the message; unavailable/failed sends must not consume them. `DATA_READY` forces current demand and ABORT invalidates the signature for subsequent navigation. The signature adds no wire field. Network levels stay within $0 \le z \le M$ during deep visual zoom (32× by default, configurable; small-image cover range can raise the visual maximum). AMP adds only tile bands reached by 300 ms projected motion, up to four per axis, while Manhattan retains the strict visible center. The server guarantees bootstrapping of root `0:0:0` with the requested demand until resident-confirmed.
 
 ## 4. Credit Negotiation: BATCH_OFFER / ACCEPT / DEFER
 
@@ -99,7 +99,7 @@ Client validates candidates against managed budget ($R + T + J + D + G \le B$).
     "reason": "insufficient_budget"
   }
   ```
-  *(On deferral or offer timeout, all offered tasks are returned to the server's priority queue without loss).*
+  *(On deferral all offered tasks are returned to the queue. Offer timeout invalidates the generation and closes the pair.)*
 
 ## 5. Binary OpCode Catalog & Payload Layouts (Data Channel)
 
@@ -163,7 +163,7 @@ Emitted strictly once all asynchronous tile decodes are complete and terminal:
 ```
 - Server rejects any ACK with missing terminal results, count mismatch, or stale generation.
 - `terminalResults` must contain exact partition of planned keys (`admitted`, `discarded`, `failed_decode`, or `omitted`).
-- `admittedKeys` is a strict subset of keys with status `admitted` currently resident in client cache.
+- `admittedKeys` is a subset (possibly the full set) of keys with status `admitted` that are currently resident in client cache.
 - Monotonic sequence `residencySeq` prevents late ACKs from resurrecting evicted tiles.
 
 ### EVICT (Client -> Server)
@@ -189,3 +189,15 @@ Emitted strictly once all asynchronous tile decodes are complete and terminal:
   - $G$: Granted credit for accepted offers not yet materialized.
 - Transitions: Available $\to G \to J \to D \to R$.
 - On session reset: `retireGeneration()` closes all resident bitmaps, clears $G$, and preserves borrowed bitmaps in $T$ until frame completion.
+## 8. Recovery and validation contract (2026-10-05)
+
+- Only the socket owning a session can close/error its paired sockets. Stale/rejected data sockets have no session ownership. SessionManager removes the exact session instance immediately. Data pairing requires HELLO, current nonempty generationId and open control; duplicate data connections are rejected.
+- Browser callbacks verify socket identity. Failure immediately clears generationId, detaches callbacks, cancels queued decode work and inactive grants. Already-started decodes keep J/D charges until completion and close obsolete results without admission or ACK.
+- StrictJson and ControlMessage parse complete bounded JSON before session mutation: 65,536 characters, depth 12, up to 1,024 members/elements; duplicate fields and trailing input rejected. Integer fields reject decimals, exponents, strings, missing values and overflow. HELLO requires clientVersion 1.0, protocolProfile BATCH_STREAM_V2 and matching clientId.
+- Control messages, pumps and timeout expiration use a FIFO per session (256 pending commands maximum). Epochs cannot decrease. Viewport bounds must be ordered and clamped demand is limited to 4,096 cells.
+- BATCH_DEFER only affects the current generation/batch and returns tasks without a retry loop. CREDIT_AVAILABLE is a new control message: {"type":"CREDIT_AVAILABLE","generationId":"<current UUID>"}. The client coalesces it after capacity/protection changes; it wakes a deferred session. SYNC_VIEW can also resume demand.
+- EVICT uses strictly increasing residencySeq and reconstructs logical current demand even after queue drain. ACK reconciliation restores still-needed keys released by completed transfers. ABORT removes canceled logical demand until the next SYNC_VIEW.
+- Offer timeout (3 seconds) or batch ACK timeout (5 seconds) invalidates and closes the pair. Never reuse an uncertain transfer/generation. Reconnect negotiates a new generation, resends current viewport, and bootstraps root. CLOSED is terminal and releases queues, ownership, confirmed residency, timeouts and socket references.
+- Credit is an identity token with compressed/raster phases and an entry reservation. Resident entries plus reserved new slots cannot exceed maxCacheEntries (default 512). Compressed grants plus pending JPEG cannot exceed maxPendingJpegBytes (default 8 MiB). Application passes the locally imported CLIENT_CONFIG to ProtocolClient, including maxConcurrentDecodes (default 4); CLIENT_CONFIG is not a network message.
+- Token release is idempotent. Decode admission verifies width * height * 4 equals reserved raster cost. Started decodes survive retirement only as charged work pending cleanup; they cannot admit to a new session.
+- Client validates full BEGIN/TILE/END lengths before reads, epoch/grant/manifest identity, unique keys, JPEG lengths/total, received counts and omitted-key partition. Malformed binary closes the pair. Existing 12-byte header and binary opcode layouts remain unchanged.

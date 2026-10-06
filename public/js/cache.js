@@ -31,6 +31,10 @@ export class TileCache {
         this.pendingJpegBytes = 0;
         this.pendingDecodeBytes = 0;
         this.grantedBytes = 0;
+        this.reservations = new Set();
+        this.reservationKeys = new Set();
+        this.maxPendingJpegBytes = 8 * 1024 * 1024;
+        this.onCapacityAvailable = null;
 
         /** @type {Map<string, SieveNode>} */
         this.map = new Map();
@@ -69,6 +73,7 @@ export class TileCache {
     releaseFrameBorrows() {
         this.frameBorrows.clear();
         this.flushRetiredBitmaps();
+        this.notifyCapacityAvailable();
     }
 
     flushRetiredBitmaps() {
@@ -91,37 +96,86 @@ export class TileCache {
     }
 
     reserveCredit(key, compressedBytes, rasterBytes) {
-        const needed = compressedBytes + rasterBytes;
-        if (this.insufficientCapacity) return false;
-        while (this.getTotalBytes() + needed > this.maxBytes) {
-            if (!this.sieveEvictOneVictim(null)) return false;
+        if (!this.validCreditCosts(compressedBytes, rasterBytes) || this.hasReservation(key)) return null;
+        if (this.reservedCompressedBytes() + compressedBytes > this.maxPendingJpegBytes) return null;
+        const newEntry = !this.map.has(key);
+        if (!this.makeRoomForCredit(key, compressedBytes + rasterBytes, newEntry)) return null;
+        const credit = { key, compCost: compressedBytes, rastCost: rasterBytes,
+            compressedPhase: 'grant', rasterPhase: 'grant', newEntry };
+        this.reservations.add(credit);
+        this.reservationKeys.add(key);
+        this.grantedBytes += compressedBytes + rasterBytes;
+        return credit;
+    }
+
+    validCreditCosts(compressedBytes, rasterBytes) {
+        return Number.isSafeInteger(compressedBytes) && compressedBytes > 0 &&
+            Number.isSafeInteger(rasterBytes) && rasterBytes > 0 && !this.insufficientCapacity;
+    }
+
+    hasReservation(key) {
+        return this.reservationKeys.has(key);
+    }
+
+    reservedCompressedBytes() {
+        return Array.from(this.reservations).reduce((total, credit) =>
+            total + (credit.compressedPhase !== 'released' ? credit.compCost : 0), 0);
+    }
+
+    reservedEntryCount() {
+        return Array.from(this.reservations).filter(credit => credit.newEntry).length;
+    }
+
+    makeRoomForCredit(key, bytes, newEntry) {
+        while (this.getTotalBytes() + bytes > this.maxBytes ||
+            this.map.size + this.reservedEntryCount() + Number(newEntry) > this.maxEntries) {
+            if (!this.sieveEvictOneVictim(key)) return false;
         }
-        this.grantedBytes += needed;
         return true;
     }
 
-    releaseCredit(compressedBytes, rasterBytes) {
-        const total = compressedBytes + rasterBytes;
-        this.grantedBytes = Math.max(0, this.grantedBytes - total);
+    transitionGrantToJpeg(credit) {
+        if (!this.reservations.has(credit) || credit.compressedPhase !== 'grant') return false;
+        this.grantedBytes -= credit.compCost;
+        this.pendingJpegBytes += credit.compCost;
+        credit.compressedPhase = 'jpeg';
+        return true;
     }
 
-    transitionGrantToJpeg(compressedBytes) {
-        this.grantedBytes = Math.max(0, this.grantedBytes - compressedBytes);
-        this.pendingJpegBytes += compressedBytes;
+    transitionGrantToDecode(credit) {
+        if (!this.reservations.has(credit) || credit.rasterPhase !== 'grant') return false;
+        this.grantedBytes -= credit.rastCost;
+        this.pendingDecodeBytes += credit.rastCost;
+        credit.rasterPhase = 'decode';
+        return true;
     }
 
-    transitionGrantToDecode(rasterBytes) {
-        this.grantedBytes = Math.max(0, this.grantedBytes - rasterBytes);
-        this.pendingDecodeBytes += rasterBytes;
+    releaseCredit(credit) { this.releaseReservation(credit); }
+    releaseDecode(credit) { this.releaseReservation(credit); }
+
+    releaseReservation(credit) {
+        if (!this.reservations.delete(credit)) return;
+        this.reservationKeys.delete(credit.key);
+        this.releaseCompressedPhase(credit);
+        this.releaseRasterPhase(credit);
+        credit.newEntry = false;
+        this.notifyCapacityAvailable();
     }
 
-    releaseDecode(compressedBytes, rasterBytes) {
-        if (compressedBytes > 0) {
-            this.pendingJpegBytes = Math.max(0, this.pendingJpegBytes - compressedBytes);
-        }
-        if (rasterBytes > 0) {
-            this.pendingDecodeBytes = Math.max(0, this.pendingDecodeBytes - rasterBytes);
-        }
+    releaseCompressedPhase(credit) {
+        if (credit.compressedPhase === 'grant') this.grantedBytes -= credit.compCost;
+        if (credit.compressedPhase === 'jpeg') this.pendingJpegBytes -= credit.compCost;
+        credit.compressedPhase = 'released';
+    }
+
+    releaseRasterPhase(credit) {
+        if (credit.rasterPhase === 'grant') this.grantedBytes -= credit.rastCost;
+        if (credit.rasterPhase === 'decode') this.pendingDecodeBytes -= credit.rastCost;
+        credit.rasterPhase = 'released';
+    }
+
+    notifyCapacityAvailable() {
+        if (typeof this.onCapacityAvailable === 'function') this.onCapacityAvailable();
     }
 
     retireGeneration() {
@@ -132,7 +186,11 @@ export class TileCache {
         this.immortalKeys.clear();
         this.immortalKeys.add('0:0:0');
         this.visibleKeys.clear();
-        this.grantedBytes = 0;
+        // Active decodes retain their reservation until their asynchronous finally runs.
+        for (const credit of this.reservations) {
+            if (credit.rasterPhase !== 'decode') this.releaseReservation(credit);
+        }
+        this.notifyCapacityAvailable();
     }
 
     retireSingleNode(node) {
@@ -158,7 +216,10 @@ export class TileCache {
 
     updateVisibleKeys(keySet) {
         this.visibleKeys = keySet || new Set();
+        const changed = this.lastVisibleSignature !== Array.from(this.visibleKeys).sort().join(',');
+        this.lastVisibleSignature = Array.from(this.visibleKeys).sort().join(',');
         this.markVisibleKeysDemanded();
+        if (changed) this.notifyCapacityAvailable();
     }
 
     adjustCapacity(visibleCount) {
@@ -169,25 +230,40 @@ export class TileCache {
      * Orchestrator: Stores an ImageBitmap in cache using safe replacement or SIEVE admission.
      * @param {string} key Tile identifier formatted as "zoom:x:y".
      * @param {ImageBitmap} bitmap Decoded image bitmap.
-     * @param {number} [reservedRasterBytes=0] Pre-reserved raster bytes in pendingDecodeBytes.
      * @returns {'ADMITTED'|'UPDATED'|'ALREADY_RESIDENT'|'REJECTED_CAPACITY'}
      */
-    set(key, bitmap, reservedRasterBytes = 0) {
+    set(key, bitmap) {
         if (!bitmap) return 'REJECTED_CAPACITY';
         const costBytes = this.calculateBitmapBytes(bitmap);
-
-        if (this.map.has(key)) {
-            return this.executeSafeReplacement(key, bitmap, costBytes, reservedRasterBytes);
-        }
-        return this.executeSieveAdmission(key, bitmap, costBytes, reservedRasterBytes);
+        if (this.map.has(key)) return this.executeSafeReplacement(key, bitmap, costBytes);
+        return this.executeSieveAdmission(key, bitmap, costBytes);
     }
 
-    admitDecoded(key, bitmap, rasterCost, compressedCost) {
-        const status = this.set(key, bitmap, rasterCost);
-        if (compressedCost > 0) {
-            this.pendingJpegBytes = Math.max(0, this.pendingJpegBytes - compressedCost);
+    admitDecoded(key, bitmap, credit) {
+        if (!this.validDecodedCredit(key, bitmap, credit)) return this.rejectDecoded(bitmap, credit);
+        if (this.map.get(key)?.value === bitmap) {
+            this.releaseReservation(credit);
+            return 'ALREADY_RESIDENT';
         }
+        const status = this.map.has(key)
+            ? this.executeSafeReplacement(key, bitmap, credit.rastCost, credit.rastCost)
+            : this.executeSieveAdmission(key, bitmap, credit.rastCost, credit.rastCost);
+        credit.rasterPhase = 'released';
+        this.releaseReservation(credit);
         return status;
+    }
+
+    validDecodedCredit(key, bitmap, credit) {
+        return this.reservations.has(credit) && credit.key === key && credit.rasterPhase === 'decode' &&
+            credit.compressedPhase === 'jpeg' && this.calculateBitmapBytes(bitmap) === credit.rastCost &&
+            (this.map.has(key) || this.map.size < this.maxEntries);
+    }
+
+    rejectDecoded(bitmap, credit) {
+        this.safelyCloseBitmap(bitmap);
+        this.releaseReservation(credit);
+        this.rejections++;
+        return 'REJECTED_CAPACITY';
     }
 
     get(key, isDemand = false) {
@@ -251,6 +327,9 @@ export class TileCache {
             pendingJpegBytes: this.pendingJpegBytes,
             pendingDecodeBytes: this.pendingDecodeBytes,
             grantedBytes: this.grantedBytes,
+            reservedEntries: this.reservedEntryCount(),
+            reservedCompressedBytes: this.reservedCompressedBytes(),
+            maxPendingJpegBytes: this.maxPendingJpegBytes,
             maxBytes: this.maxBytes,
             evictions: this.evictionCount,
             demandHits: this.demandHits,
@@ -263,9 +342,8 @@ export class TileCache {
     // --- Sub-functions (Single-responsibility) ---
 
     calculateBitmapBytes(bitmap) {
-        const w = bitmap.width || 256;
-        const h = bitmap.height || 256;
-        return w * h * 4;
+        const w = bitmap?.width, h = bitmap?.height;
+        return Number.isSafeInteger(w) && Number.isSafeInteger(h) && w > 0 && h > 0 ? w * h * 4 : Infinity;
     }
 
     executeSafeReplacement(key, newBitmap, newBytes, reservedRasterBytes = 0) {
@@ -330,7 +408,7 @@ export class TileCache {
 
     makeRoomForNewEntry(neededBytes) {
         if (this.insufficientCapacity) return false;
-        while ((this.getTotalBytes() + neededBytes > this.maxBytes) || (this.map.size + 1 > this.maxEntries)) {
+        while ((this.getTotalBytes() + neededBytes > this.maxBytes) || (this.map.size + this.reservedEntryCount() + 1 > this.maxEntries)) {
             const evicted = this.sieveEvictOneVictim(null);
             if (!evicted) return false;
         }
@@ -392,7 +470,7 @@ export class TileCache {
     }
 
     isKeyProtected(key) {
-        return this.immortalKeys.has(key) || this.visibleKeys.has(key);
+        return this.immortalKeys.has(key) || this.visibleKeys.has(key) || this.hasReservation(key);
     }
 
     markVisibleKeysDemanded() {

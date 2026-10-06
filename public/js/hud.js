@@ -31,7 +31,10 @@ export class TelemetryHud {
             toast: document.getElementById('toast-message'),
             telemetryPanel: document.getElementById('telemetry-panel'),
             btnToggleTelemetry: document.getElementById('btn-toggle-telemetry'),
-            btnCloseTelemetry: document.getElementById('btn-close-telemetry')
+            btnCloseTelemetry: document.getElementById('btn-close-telemetry'),
+            dockZoomBadge: document.getElementById('dock-zoom-badge'),
+            interpolationLabel: document.getElementById('interpolation-label'),
+            nativeZoomButton: document.getElementById('btn-zoom-100')
         };
 
         // FPS tracking
@@ -41,6 +44,8 @@ export class TelemetryHud {
         this.lastFpsUpdate = performance.now();
 
         this.toastTimeout = null;
+        this.lastReportedDigital = false;
+        this.lastReportedMax = false;
 
         this.bindEvents();
     }
@@ -152,14 +157,61 @@ export class TelemetryHud {
     }
 
     updateCameraMetrics(viewport, epoch, visibleTilesCount) {
-        if (!this.dom.zoom) return;
-
         const level = viewport.getTileLevel();
-        const scale = viewport.currentScale.toFixed(3);
-        this.dom.zoom.textContent = `L${level} (×${scale})`;
-        this.dom.epoch.textContent = epoch;
-        this.dom.coords.textContent = `X: ${Math.round(viewport.camX)}, Y: ${Math.round(viewport.camY)}`;
-        this.dom.visibleTiles.textContent = visibleTilesCount;
+        const scalePercent = Math.round(viewport.currentScale * 100);
+        const isDigital = viewport.currentScale > 1.05;
+
+        this.updateZoomDomText(level, viewport.maxZoom, scalePercent, isDigital);
+        this.updateDockBadge(scalePercent);
+        this.updateNativeZoomControl(viewport);
+        this.checkZoomToasts(viewport);
+
+        if (this.dom.epoch) this.dom.epoch.textContent = epoch;
+        if (this.dom.coords) this.dom.coords.textContent = `X: ${Math.round(viewport.camX)}, Y: ${Math.round(viewport.camY)}`;
+        if (this.dom.visibleTiles) this.dom.visibleTiles.textContent = visibleTilesCount;
+    }
+
+    updateZoomDomText(level, maxZoom, scalePercent, isDigital) {
+        if (!this.dom.zoom) return;
+        const tag = isDigital ? ' · Ampliación digital' : '';
+        this.dom.zoom.textContent = `Nivel ${level}/${maxZoom} · ${scalePercent}%${tag}`;
+    }
+
+    updateDockBadge(scalePercent) {
+        if (this.dom.dockZoomBadge) {
+            this.dom.dockZoomBadge.textContent = `${scalePercent}%`;
+        }
+    }
+
+    updateNativeZoomControl(viewport) {
+        const button = this.dom.nativeZoomButton;
+        if (!button) return;
+        button.disabled = viewport.minScale > 1;
+        button.title = button.disabled
+            ? 'El modo panorámico necesita más de 100 % para cubrir esta ventana'
+            : 'Tamaño original 100 % (1:1)';
+    }
+
+    checkZoomToasts(viewport) {
+        if (!this.lastReportedDigital && viewport.currentScale >= 1.05) {
+            this.showToast('Ampliación de los píxeles originales', 2000);
+            this.lastReportedDigital = true;
+        } else if (this.lastReportedDigital && viewport.currentScale < 0.95) {
+            this.lastReportedDigital = false;
+        }
+
+        if (!this.lastReportedMax && Math.abs(viewport.currentScale - viewport.maxScale) < 0.01) {
+            this.showToast(`Zoom máximo alcanzado (${Math.round(viewport.maxScale * 100)}%)`, 2000);
+            this.lastReportedMax = true;
+        } else if (this.lastReportedMax && viewport.currentScale < viewport.maxScale * 0.95) {
+            this.lastReportedMax = false;
+        }
+    }
+
+    setInterpolationLabel(mode) {
+        if (this.dom.interpolationLabel) {
+            this.dom.interpolationLabel.textContent = (mode === 'pixels') ? 'Píxeles' : 'Suave';
+        }
     }
 
     updateNetworkMetrics(bytesTotal) {

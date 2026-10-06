@@ -6,7 +6,7 @@ import com.uhip.session.SessionManager;
 import com.uhip.storage.TileManager;
 import com.uhip.tools.GuiPicker;
 import com.uhip.tools.TileCutter;
-import com.uhip.tools.VipsTileSlicer;
+import com.uhip.tools.TileSlicer;
 import com.uhip.ws.ControlWebSocket;
 import com.uhip.ws.DataWebSocket;
 
@@ -43,13 +43,17 @@ public final class Main {
     private static void handleCommandLineArguments(String[] args) throws Exception {
         String first = args[0].toLowerCase();
         if (first.equals("--slice") || first.equals("-s")) {
-            VipsTileSlicer.main(Arrays.copyOfRange(args, 1, args.length));
+            launchSlicerCommandLine(args);
         } else if (first.equals("--synthetic")) {
             TileCutter.main(args);
         } else {
             ServerConfig config = resolveCliConfig(args);
             startServer(config);
         }
+    }
+    private static void launchSlicerCommandLine(String[] args) throws Exception {
+        if(args.length==1) launchSlicerInteractive(new BufferedReader(new InputStreamReader(System.in)));
+        else TileSlicer.main(Arrays.copyOfRange(args,1,args.length));
     }
 
     private static void runInteractiveSelector() throws Exception {
@@ -78,7 +82,7 @@ public final class Main {
     }
 
     private static void launchSlicerInteractive(BufferedReader reader) throws Exception {
-        Path generatedDir = VipsTileSlicer.runInteractive(reader);
+        Path generatedDir = TileSlicer.runInteractive(reader);
         if (generatedDir != null) {
             promptAndStartAfterProcessing(reader, generatedDir);
         }
@@ -88,7 +92,8 @@ public final class Main {
         System.out.print("[UHIP] Ingrese el nivel máximo de zoom (por defecto 4): ");
         String zoomStr = reader.readLine();
         int maxZoom = (zoomStr != null && zoomStr.matches("\\d+")) ? Integer.parseInt(zoomStr) : 4;
-        Path outDir = Path.of("tiles");
+        Path outDir = Path.of("tiles_demo");
+        if (Files.exists(outDir)) outDir = Path.of("tiles_demo_" + java.util.UUID.randomUUID());
 
         TileCutter.main(new String[]{"--synthetic", String.valueOf(maxZoom), outDir.toString()});
         promptAndStartAfterProcessing(reader, outDir);
@@ -129,7 +134,7 @@ public final class Main {
         System.out.println("==================================================================");
         System.out.println("Seleccione el modo de operación:");
         System.out.println("  [1] Iniciar Servidor UHIP (Servir imágenes a múltiples clientes web)");
-        System.out.println("  [2] Cortar / Procesar Imagen Masiva (Generador de Teselas VIPS)");
+        System.out.println("  [2] Cortar / Procesar Imagen Masiva (Java nativo o libvips)");
         System.out.println("  [3] Generar Dataset Sintético de Prueba (Procedural)");
         System.out.println("  [4] Salir");
         System.out.println("==================================================================");
